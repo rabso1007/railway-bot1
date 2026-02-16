@@ -1,0 +1,10 @@
+ccxt
+pandas
+numpy
+ta
+scipy
+tqdm
+aiohttp
+nest_asyncio
+matplotlib
+TA-Lib
