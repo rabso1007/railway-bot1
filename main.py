@@ -62,27 +62,6 @@ except ImportError:
     TALIB_AVAILABLE = False
     print("⚠️ TA-Lib غير متوفر - سيتم استخدام ta")
 
-# ===================== FALLBACK for asyncio.timeout (Python < 3.11) =====================
-if sys.version_info >= (3, 11):
-    from asyncio import timeout as asyncio_timeout
-else:
-    class TimeoutContext:
-        def __init__(self, delay):
-            self.delay = delay
-            self.task = None
-        
-        async def __aenter__(self):
-            self.task = asyncio.current_task()
-            self.deadline = asyncio.get_event_loop().time() + self.delay
-            return self
-        
-        async def __aexit__(self, exc_type, exc_val, exc_tb):
-            pass
-    
-    @contextmanager
-    def timeout(delay):
-        return TimeoutContext(delay)
-
 # ===================== LOGGING =====================
 logging.basicConfig(
     level=logging.INFO,
@@ -573,6 +552,11 @@ def ensure_timestamp_column(df: pd.DataFrame) -> pd.DataFrame:
     
     return df
 
+# ===================== STABLE HASH FUNCTION =====================
+def stable_hash(s: str) -> int:
+    """مؤشر تجزئة ثابت عبر عمليات التشغيل"""
+    return int(hashlib.md5(s.encode()).hexdigest(), 16)
+
 # ===================== DATA CLASSES =====================
 @dataclass
 class MarketStructure:
@@ -686,6 +670,7 @@ class TradeState:
     is_paper: bool = False
     execution_mode: str = "SIGNAL"
     entry_assumed: bool = False
+    is_exiting: bool = False  # علم لمنع الدخول المتزامن في partial_exit
     _version: int = 0
 
     def update_timestamp(self):
@@ -914,6 +899,9 @@ CONFIG = {
     "RETRY_MAX_RETRIES": 3,
     "RETRY_BASE_DELAY": 1,
     "RETRY_MAX_DELAY": 60,
+    
+    # Reconciliation
+    "RECONCILIATION_INTERVAL_SEC": 300,  # كل 5 دقائق
 }
 
 # ===================== TELEGRAM ENV AUTO-LOAD =====================
@@ -3398,9 +3386,9 @@ def should_run_order_flow(symbol: str, mtf_alignment: int, precheck_score: float
             return True
     
     if mtf_alignment >= 2 and CONFIG.get("ORDER_FLOW_SAMPLING_ENABLED", True):
-        # توزيع عشوائي حسب الرمز لمنع الـ bursts
+        # توزيع عشوائي حسب الرمز باستخدام دالة تجزئة ثابتة
         sample_every = CONFIG.get("ORDER_FLOW_SAMPLE_EVERY_N_LOOPS", 3)
-        symbol_hash = hash(symbol) % sample_every
+        symbol_hash = stable_hash(symbol) % sample_every
         if symbol_hash == loop_count % sample_every:
             return True
     
@@ -3503,6 +3491,59 @@ async def emergency_state_monitor(exchange):
         except Exception as e:
             logger.error(f"[Emergency Monitor Main Error] {str(e)}")
             await asyncio.sleep(60)
+
+# ===================== BALANCE RECONCILIATION TASK =====================
+async def reconcile_balances(exchange):
+    """
+    مهمة دورية لمقارنة الأرصدة الفعلية على المنصة مع المراكز المتوقعة.
+    """
+    while not shutdown_manager.should_stop:
+        await asyncio.sleep(CONFIG.get("RECONCILIATION_INTERVAL_SEC", 300))
+        
+        if not is_live_trading_enabled():
+            continue
+        
+        if not ACTIVE_TRADES:
+            continue
+        
+        try:
+            # جلب الرصيد الكامل
+            balance = await exchange.fetch_balance()
+            if not balance:
+                continue
+            
+            for symbol, trade in list(ACTIVE_TRADES.items()):
+                try:
+                    base_asset = symbol.split('/')[0]
+                    real_balance = balance['free'].get(base_asset, 0.0)
+                    
+                    expected = trade.entry_fill_amount * trade.remaining_position
+                    
+                    if abs(real_balance - expected) > CONFIG["MIN_DUST_THRESHOLD"]:
+                        logger.warning(f"[Reconciliation] Mismatch for {symbol}: expected {expected:.8f}, real {real_balance:.8f}")
+                        await send_telegram(
+                            f"⚠️ تنبيه المطابقة\n\n"
+                            f"الرمز: {escape_html(symbol)}\n"
+                            f"الرصيد المتوقع: {expected:.8f} {base_asset}\n"
+                            f"الرصيد الفعلي: {real_balance:.8f} {base_asset}\n"
+                            f"الفرق: {abs(real_balance - expected):.8f}\n\n"
+                            f"قد يكون هناك تنفيذ غير متوقع أو خطأ في الحسابات الداخلية.",
+                            critical=False
+                        )
+                        
+                        # يمكن إضافة منطق إيقاف التداول لهذا الرمز إذا كان الفرق كبيراً
+                        if abs(real_balance - expected) > expected * 0.1:  # فرق 10%
+                            await mark_trade_emergency(
+                                symbol,
+                                reason=f"Reconciliation mismatch: expected {expected}, real {real_balance}",
+                                critical_msg=f"🚨 Reconciliation Critical: {symbol}\nفرق كبير بين الرصيد الفعلي والمتوقع. يرجى المراجعة الفورية."
+                            )
+                except Exception as e:
+                    logger.error(f"[Reconciliation] Error processing {symbol}: {e}")
+                    continue
+        
+        except Exception as e:
+            logger.error(f"[Reconciliation] Main error: {e}")
 
 # ===================== INSTITUTIONAL SIGNAL GENERATOR (مُعاد هيكلته) =====================
 @metrics.record_latency("signal_generation")
@@ -4127,11 +4168,8 @@ async def monitor_active_trades(exchange):
         return
     
     try:
-        if sys.version_info >= (3, 11):
-            async with asyncio_timeout(30):
-                await _monitor_active_trades_internal(exchange)
-        else:
-            await _monitor_active_trades_internal(exchange)
+        # استخدام wait_for لفرض مهلة قصوى على الدورة بأكملها
+        await asyncio.wait_for(_monitor_active_trades_internal(exchange), timeout=30)
     except asyncio.TimeoutError:
         logger.error("[Monitor] Timeout exceeded - skipping this cycle")
     except Exception as e:
@@ -4304,126 +4342,120 @@ async def fetch_ticker_with_lock(exchange, symbol):
         logger.error(f"[Ticker Error] {symbol}: {e}")
         return None
 
-# ===================== ENHANCED PARTIAL EXIT (مع إدارة SL على المنصة) =====================
+# ===================== ENHANCED PARTIAL EXIT (مع إدارة SL على المنصة ومع race condition fix) =====================
 async def partial_exit(symbol: str, trade: TradeState, exit_price: float,
                       tp_level: str, exit_pct: float, r_multiple: float, exchange=None):
-    # قراءة البيانات تحت القفل
-    try:
-        if not await bot.get_trade_lock(symbol):
-            logger.error(f"[partial_exit] Failed to acquire lock for {symbol}")
-            return
-        
-        try:
-            if symbol not in ACTIVE_TRADES:
-                return
-            
-            current_trade = ACTIVE_TRADES[symbol]
-            
-            if tp_level == "TP1" and current_trade.tp1_hit:
-                return
-            elif tp_level == "TP2" and current_trade.tp2_hit:
-                return
-            elif tp_level == "TP3" and current_trade.tp3_hit:
-                return
-            
-            if tp_level == "TP1":
-                current_trade.tp1_order_done = True
-            elif tp_level == "TP2":
-                current_trade.tp2_order_done = True
-            elif tp_level == "TP3":
-                current_trade.tp3_order_done = True
-            
-            entry_fill_amount = current_trade.entry_fill_amount
-            current_version = current_trade._version
-            sl_order_id = current_trade.sl_order_id
-            
-            db_manager.save_trade(current_trade)
-            
-        finally:
-            bot.release_trade_lock(symbol)
-    except Exception as e:
-        logger.error(f"[partial_exit] Initial lock error: {str(e)[:100]}")
-        return
-    
-    sell_amount_base = entry_fill_amount * exit_pct
-    live_sell_ok = True
-    fill_price = exit_price  # افتراضي
-    
-    if is_live_trading_enabled() and exchange and sell_amount_base > 0:
-        sell_order = await market_sell_safe(exchange, symbol, sell_amount_base, max_retries=2)
-        live_sell_ok = bool(sell_order)
-        
-        if live_sell_ok and sell_order:
-            # استخراج سعر التنفيذ الفعلي
-            fill_price = safe_float(sell_order.get('average')) or safe_float(sell_order.get('price')) or exit_price
-            if not validate_price(fill_price):
-                fill_price = exit_price
-        
-        if not live_sell_ok:
-            if await bot.get_trade_lock(symbol):
-                try:
-                    if symbol in ACTIVE_TRADES:
-                        if tp_level == "TP1":
-                            ACTIVE_TRADES[symbol].tp1_order_done = False
-                        elif tp_level == "TP2":
-                            ACTIVE_TRADES[symbol].tp2_order_done = False
-                        elif tp_level == "TP3":
-                            ACTIVE_TRADES[symbol].tp3_order_done = False
-                finally:
-                    bot.release_trade_lock(symbol)
-            
-            await mark_trade_emergency(symbol, f"partial_sell_failed({tp_level})")
-            return
-        
-        # إذا كان هناك أمر SL على المنصة، يجب إلغاؤه وتحديثه بالكمية المتبقية
-        if sl_order_id and exchange:
-            remaining_base = entry_fill_amount * (trade.remaining_position - exit_pct)
-            if remaining_base > 0:
-                # إلغاء الأمر القديم
-                await cancel_stop_loss_order(exchange, symbol, sl_order_id)
-                # وضع أمر جديد للكمية المتبقية
-                new_sl_order = await place_stop_loss_order(exchange, symbol, trade.current_sl, remaining_base)
-                if new_sl_order:
-                    if await bot.get_trade_lock(symbol):
-                        try:
-                            if symbol in ACTIVE_TRADES:
-                                ACTIVE_TRADES[symbol].sl_order_id = str(new_sl_order.get("id"))
-                        finally:
-                            bot.release_trade_lock(symbol)
-                else:
-                    logger.warning(f"[partial_exit] Failed to place new SL for {symbol}")
-    
-    # إعادة القفل لتحديث الحالة
+    # الاحتفاظ بالقفل طوال العملية
     if not await bot.get_trade_lock(symbol):
-        logger.error(f"[partial_exit] Failed to reacquire lock for {symbol}")
+        logger.error(f"[partial_exit] Failed to acquire lock for {symbol}")
         return
     
     try:
         if symbol not in ACTIVE_TRADES:
             return
         
-        # إعادة حساب R بناءً على سعر التنفيذ الفعلي
+        current_trade = ACTIVE_TRADES[symbol]
+        
+        # التحقق من is_exiting
+        if current_trade.is_exiting:
+            logger.warning(f"[partial_exit] Exit already in progress for {symbol}, skipping")
+            return
+        
+        # تعيين علامة الخروج
+        current_trade.is_exiting = True
+        
+        # قراءة البيانات المطلوبة
+        if tp_level == "TP1" and current_trade.tp1_hit:
+            return
+        elif tp_level == "TP2" and current_trade.tp2_hit:
+            return
+        elif tp_level == "TP3" and current_trade.tp3_hit:
+            return
+        
+        if tp_level == "TP1":
+            current_trade.tp1_order_done = True
+        elif tp_level == "TP2":
+            current_trade.tp2_order_done = True
+        elif tp_level == "TP3":
+            current_trade.tp3_order_done = True
+        
+        entry_fill_amount = current_trade.entry_fill_amount
+        current_version = current_trade._version
+        sl_order_id = current_trade.sl_order_id
+        
+        # حفظ حالة مؤقتة (يمكن تحديثها لاحقاً)
+        db_manager.save_trade(current_trade)
+        
+        # تنفيذ البيع (داخل القفل)
+        sell_amount_base = entry_fill_amount * exit_pct
+        live_sell_ok = True
+        fill_price = exit_price  # افتراضي
+        
+        if is_live_trading_enabled() and exchange and sell_amount_base > 0:
+            sell_order = await market_sell_safe(exchange, symbol, sell_amount_base, max_retries=2)
+            live_sell_ok = bool(sell_order)
+            
+            if live_sell_ok and sell_order:
+                # استخراج سعر التنفيذ الفعلي
+                fill_price = safe_float(sell_order.get('average')) or safe_float(sell_order.get('price')) or exit_price
+                if not validate_price(fill_price):
+                    fill_price = exit_price
+            
+            if not live_sell_ok:
+                # إعادة تعيين العلامات
+                if tp_level == "TP1":
+                    current_trade.tp1_order_done = False
+                elif tp_level == "TP2":
+                    current_trade.tp2_order_done = False
+                elif tp_level == "TP3":
+                    current_trade.tp3_order_done = False
+                
+                # إلغاء علامة الخروج
+                current_trade.is_exiting = False
+                
+                # حفظ الحالة المعدلة
+                db_manager.save_trade(current_trade)
+                
+                # تفعيل حالة الطوارئ
+                asyncio.create_task(mark_trade_emergency(symbol, f"partial_sell_failed({tp_level})"))
+                return
+            
+            # إذا كان هناك أمر SL على المنصة، يجب إلغاؤه وتحديثه بالكمية المتبقية
+            if sl_order_id and exchange:
+                remaining_base = entry_fill_amount * (current_trade.remaining_position - exit_pct)
+                if remaining_base > 0:
+                    # إلغاء الأمر القديم
+                    await cancel_stop_loss_order(exchange, symbol, sl_order_id)
+                    # وضع أمر جديد للكمية المتبقية
+                    new_sl_order = await place_stop_loss_order(exchange, symbol, current_trade.current_sl, remaining_base)
+                    if new_sl_order:
+                        current_trade.sl_order_id = str(new_sl_order.get("id"))
+                    else:
+                        logger.warning(f"[partial_exit] Failed to place new SL for {symbol}")
+        
+        # تحديث الحالة بعد البيع
         risk = trade.entry - trade.original_sl
         actual_r_multiple = (fill_price - trade.entry) / risk if risk > 0 else 0
         exit_r = actual_r_multiple * exit_pct
         
         # التحقق من الإصدار (دمج بسيط)
-        if ACTIVE_TRADES[symbol]._version != current_version:
-            logger.warning(f"[partial_exit] Version mismatch for {symbol}. Expected {current_version}, got {ACTIVE_TRADES[symbol]._version}. Proceeding.")
+        if current_trade._version != current_version:
+            logger.warning(f"[partial_exit] Version mismatch for {symbol}. Expected {current_version}, got {current_trade._version}. Proceeding.")
         
-        ACTIVE_TRADES[symbol].remaining_position -= exit_pct
-        ACTIVE_TRADES[symbol].total_realized_r += exit_r
+        current_trade.remaining_position -= exit_pct
+        current_trade.total_realized_r += exit_r
         
         if tp_level == "TP1":
-            ACTIVE_TRADES[symbol].tp1_hit = True
+            current_trade.tp1_hit = True
         elif tp_level == "TP2":
-            ACTIVE_TRADES[symbol].tp2_hit = True
+            current_trade.tp2_hit = True
         elif tp_level == "TP3":
-            ACTIVE_TRADES[symbol].tp3_hit = True
+            current_trade.tp3_hit = True
         
-        ACTIVE_TRADES[symbol]._version += 1
+        current_trade._version += 1
+        current_trade.is_exiting = False  # إعادة تعيين علامة الخروج
         
-        db_manager.save_trade(ACTIVE_TRADES[symbol])
+        db_manager.save_trade(current_trade)
         
     finally:
         bot.release_trade_lock(symbol)
@@ -4632,7 +4664,7 @@ async def generate_performance_report() -> str:
 • SL on Exchange: {'ON' if CONFIG.get('LIVE_PLACE_SL_ORDER') else 'OFF'}
 
 ✅ التحسينات المؤسسية المطبقة
-• ✅ Atomic Partial Exit with Optimistic Locking
+• ✅ Atomic Partial Exit with Optimistic Locking + is_exiting flag
 • ✅ Enhanced Lock Manager with Recovery & Blacklisting (TTL)
 • ✅ Database Connection Leaks Fixed
 • ✅ Smart Cache with Memory Management
@@ -4644,13 +4676,15 @@ async def generate_performance_report() -> str:
 • ✅ TA-Lib Import Fixed
 • ✅ Liquidity Grab Support/Resistance Fix
 • ✅ Daily Circuit Double Counting Fix
-• ✅ Order Flow Sampling Logic Fixed (staggered per symbol)
+• ✅ Order Flow Sampling Logic Fixed (staggered per symbol + stable hash)
 • ✅ Position Sizing Order Corrected
 • ✅ Volume Gate Slice Safety Added
 • ✅ Volume Profile precheck_score fix
 • ✅ close_trade_full final_exit_r defined
 • ✅ Trade history stores total R, stats incremental
 • ✅ SL order management on partial exits
+• ✅ Balance Reconciliation Task Added
+• ✅ asyncio.timeout fallback removed, replaced with asyncio.wait_for
 
 🧯 Daily Circuit
 • Enabled: {'ON' if CONFIG.get('ENABLE_DAILY_MAX_LOSS', True) else 'OFF'}
@@ -4876,6 +4910,7 @@ async def main_loop(exchange):
     emergency_monitor_task = None
     checkpoint_task = None
     memory_task = None
+    reconciliation_task = None
     runner = None
     site = None
     
@@ -4912,10 +4947,13 @@ async def main_loop(exchange):
         logger.info("  8. إضافة التحقق من صحة slice الحجم في price_acceptance_gate")
         logger.info("  9. إزالة المتغيرات غير المستخدمة (next_candle)")
         logger.info(" 10. تحسين إيقاف تشغيل خادم health check")
-        logger.info(" 11. تحسين أخذ عينات order flow (staggered per symbol)")
+        logger.info(" 11. تحسين أخذ عينات order flow (staggered per symbol) + stable hash")
         logger.info(" 12. إصلاح Volume Profile بتمرير precheck_score")
         logger.info(" 13. تحسين المراقبة بجلب tickers بالتوازي")
         logger.info(" 14. تحسين التحقق من صحة الرموز (whitelist)")
+        logger.info(" 15. إصلاح Race Condition في partial_exit (قفل طوال العملية + is_exiting)")
+        logger.info(" 16. إزالة fallback asyncio.timeout واستخدام asyncio.wait_for مباشرة")
+        logger.info(" 17. إضافة مهمة Reconciliation للمطابقة بين الرصيد والمراكز")
         logger.info("="*70)
         
         db_manager.init_database()
@@ -4953,6 +4991,10 @@ async def main_loop(exchange):
             emergency_monitor_task = asyncio.create_task(emergency_state_monitor(exchange))
             shutdown_manager.add_task(emergency_monitor_task)
             logger.info("[Main] Emergency state monitor started")
+            
+            reconciliation_task = asyncio.create_task(reconcile_balances(exchange))
+            shutdown_manager.add_task(reconciliation_task)
+            logger.info("[Main] Balance reconciliation task started")
         
         await send_telegram(f"""
 🚀 تم تشغيل Quantum Flow Bot v1.8.4 - ULTIMATE INSTITUTIONAL EDITION
@@ -4966,7 +5008,7 @@ async def main_loop(exchange):
 • SL on Exchange: {'ON' if CONFIG.get('LIVE_PLACE_SL_ORDER') else 'OFF'}
 
 ✅ التحسينات المؤسسية المطبقة
-• ✅ Atomic Partial Exit with Optimistic Locking
+• ✅ Atomic Partial Exit with Optimistic Locking + is_exiting flag
 • ✅ Enhanced Lock Manager with Recovery & Blacklisting (TTL)
 • ✅ Database Connection Leaks Fixed
 • ✅ Smart Cache with Memory Management
@@ -4978,13 +5020,15 @@ async def main_loop(exchange):
 • ✅ TA-Lib Import Fixed
 • ✅ Liquidity Grab Support/Resistance Fix
 • ✅ Daily Circuit Double Counting Fix
-• ✅ Order Flow Sampling Logic Fixed (staggered per symbol)
+• ✅ Order Flow Sampling Logic Fixed (staggered per symbol + stable hash)
 • ✅ Position Sizing Order Corrected
 • ✅ Volume Gate Slice Safety Added
 • ✅ Volume Profile precheck_score fix
 • ✅ close_trade_full final_exit_r defined
 • ✅ Trade history stores total R, stats incremental
 • ✅ SL order management on partial exits
+• ✅ Balance Reconciliation Task Added
+• ✅ asyncio.timeout fallback removed, replaced with asyncio.wait_for
 
 🧯 Daily Circuit
 • Enabled: {'ON' if CONFIG.get('ENABLE_DAILY_MAX_LOSS', True) else 'OFF'}
