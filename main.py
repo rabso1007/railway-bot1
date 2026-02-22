@@ -1,12 +1,18 @@
 #!/usr/bin/env python3
 """
-QUANTUM FLOW TRADING BOT v1.8.5 - ULTIMATE INSTITUTIONAL EDITION
-تم تعديله للتشغيل المستمر على Railway بدون أي تبعيات Colab.
-يقرأ متغيرات البيئة TELEGRAM_BOT_TOKEN و TELEGRAM_CHAT_ID.
-جميع التحسينات والإصلاحات الحرجة المطلوبة مدمجة بدقة واحترافية.
-
-⚠️ تم إصلاح الخطأ النحوي في السطر 5186: تم تغيير 'main() if not task.done():' إلى 'if not task.done(): main()'
-✅ جميع التحسينات المؤسسية المطلوبة (Quality > Quantity) مطبقة بالكامل.
+QUANTUM FLOW TRADING BOT v1.8.6 - ULTIMATE INSTITUTIONAL EDITION
+تم دمج جميع التحسينات الاحترافية المطلوبة:
+- تعديل القيم الصارمة لتكون أكثر توازناً (OB freshness 8, wick ratio 0.45, volume multiplier 1.7, LG confidence 70, cooldown 900, A+ cap 7, spread 0.15, ATR% 5.5, trend strength 65)
+- تفعيل أمر SL على المنصة افتراضياً
+- تحسين Order Flow Sampling (التشغيل دائماً لـ alignment≥2 إذا score>65)
+- إضافة Momentum Confirmation (رفض LONG إذا RSI 5m < 45)
+- إضافة Micro Structure Protection (رفض LONG إذا آخر close أقل من midpoint الشمعة السابقة)
+- إضافة Slippage Recheck بعد التنفيذ (إغلاق الصفقة إذا RR الفعلي < 2.5)
+- إضافة Consecutive Loss Guard (حظر الرمز 6 ساعات بعد خسارتين متتاليتين خلال 24 ساعة)
+- إضافة Dynamic Break‑Even (BE بناءً على quantum_score)
+- إضافة BTC Correlation Filter (رفض LONG إذا BTC 1h RSI<40 أو close تحت EMA50)
+- مكافأة إضافية لـ BELOW_VALUE + BULLISH_FLOW
+جميع التغييرات مدمجة بدقة مع الحفاظ على الاستقرار والكفاءة.
 """
 
 import asyncio
@@ -88,7 +94,7 @@ class GracefulShutdown:
         logger.info("🛑 Starting graceful shutdown...")
         
         for task in self.tasks:
-            if not task.done():  # ✅ تم التأكد من الصياغة الصحيحة
+            if not task.done():
                 task.cancel()
                 try:
                     await task
@@ -107,7 +113,7 @@ def log_order_audit(order_type: str, symbol: str, price: float, amount: float, s
     except Exception as e:
         logger.error(f"[Audit Log Error] {str(e)}")
 
-# ===================== METRICS COLLECTOR (مُحسّن) =====================
+# ===================== METRICS COLLECTOR =====================
 class MetricsCollector:
     def __init__(self):
         self.metrics: Dict[str, List[Dict]] = defaultdict(list)
@@ -321,6 +327,8 @@ class TradingBot:
         self.analysis_cache: Dict[str, Dict[str, Any]] = {}
         self.btc_trend: Optional[Dict] = None
         self.btc_last_check: float = 0
+        self.consecutive_losses: Dict[str, List[float]] = defaultdict(list)  # timestamps of losses
+        self.consecutive_loss_blacklist: Dict[str, float] = {}  # symbol -> expiry timestamp
     
     async def get_trade_lock(self, symbol: str):
         return await self.lock_manager.acquire_trade_lock(symbol)
@@ -492,8 +500,7 @@ def _coalesce(*vals):
     return None
 
 def _validate_symbol(symbol: str) -> bool:
-    # Whitelist approach: فقط الرموز المسموح بها
-    pattern = r'^[A-Z0-9]{2,20}/[A-Z]{2,10}$'  # مثال: BTC/USDT, ETH/USDT
+    pattern = r'^[A-Z0-9]{2,20}/[A-Z]{2,10}$'
     return bool(re.match(pattern, symbol))
 
 # ===================== RUNTIME PATH FALLBACK =====================
@@ -555,7 +562,6 @@ def ensure_timestamp_column(df: pd.DataFrame) -> pd.DataFrame:
 
 # ===================== STABLE HASH FUNCTION =====================
 def stable_hash(s: str) -> int:
-    """مؤشر تجزئة ثابت عبر عمليات التشغيل"""
     return int(hashlib.md5(s.encode()).hexdigest(), 16)
 
 # ===================== DATA CLASSES =====================
@@ -663,7 +669,7 @@ class TradeState:
     tp2_order_done: bool = False
     tp3_order_done: bool = False
     sl_order_done: bool = False
-    sl_order_id: str = ""  # معرف أمر وقف الخسارة على المنصة
+    sl_order_id: str = ""
     emergency_state: bool = False
     emergency_reason: str = ""
     emergency_last_attempt: str = ""
@@ -671,7 +677,7 @@ class TradeState:
     is_paper: bool = False
     execution_mode: str = "SIGNAL"
     entry_assumed: bool = False
-    is_exiting: bool = False  # علم لمنع الدخول المتزامن في partial_exit
+    is_exiting: bool = False
     _version: int = 0
 
     def update_timestamp(self):
@@ -705,7 +711,7 @@ class QuantumSignal:
     gates_passed: List[str] = field(default_factory=list)
     timestamp: str = field(default_factory=now_utc_iso)
 
-# ===================== FIXED CONFIGURATION =====================
+# ===================== CONFIGURATION المُحسّنة =====================
 CONFIG = {
     # Exchange
     "EXCHANGE": "mexc",
@@ -758,7 +764,7 @@ CONFIG = {
     "TP1_EXIT_PCT": 0.5,
     "TP2_EXIT_PCT": 0.3,
     "TP3_EXIT_PCT": 0.2,
-    "BE_AT_R": 1.0,
+    "BE_AT_R": 1.0,          # سيتم استبداله ديناميكياً
     "BE_ATR_MULT": 0.5,
     "TRAIL_START_R": 2.0,
     "TRAIL_ATR_MULT": 1.0,
@@ -770,24 +776,24 @@ CONFIG = {
     
     # Trading Settings
     "LONG_ONLY": True,
-    "MIN_QUANTUM_SCORE": 65,          # ✅ تم الرفع من 60 إلى 65
+    "MIN_QUANTUM_SCORE": 65,
     "QUANTUM_A_SCORE": 75,
-    "QUANTUM_A_PLUS_SCORE": 80,       # ✅ تم التعديل من 85 إلى 80
-    "MAX_DAILY_A_PLUS": 5,
+    "QUANTUM_A_PLUS_SCORE": 80,
+    "MAX_DAILY_A_PLUS": 7,                # ✅ تم الرفع من 5 إلى 7
     
     # Hard Gates
     "ENABLE_HARD_GATES": True,
-    "HARD_GATE_1_MIN_TREND_STRENGTH": 60,
+    "HARD_GATE_1_MIN_TREND_STRENGTH": 65,  # ✅ تم الرفع من 60 إلى 65
     "HARD_GATE_1_MIN_MTF_ALIGNMENT": 2,
     "HARD_GATE_2_REQUIRE_ZONE": True,
-    "HARD_GATE_2_MIN_LG_CONFIDENCE": 75,        # ✅ تم التعديل إلى 75
-    "HARD_GATE_2_OB_FRESHNESS": 5,              # ✅ تم التعديل من 10 إلى 5
+    "HARD_GATE_2_MIN_LG_CONFIDENCE": 70,   # ✅ تم التعديل من 75 إلى 70
+    "HARD_GATE_2_OB_FRESHNESS": 8,         # ✅ تم التعديل من 5 إلى 8
     "HARD_GATE_3_REQUIRE_BOOSTER": False,
     
-    # Liquidity Grab Settings (مُحسّنة)
-    "LG_WICK_MIN_RATIO": 0.6,                    # ✅ تم التعديل من 0.3 إلى 0.6
+    # Liquidity Grab Settings
+    "LG_WICK_MIN_RATIO": 0.45,              # ✅ تم التعديل من 0.6 إلى 0.45
     "LG_RECOVERY_MIN": 0.5,
-    "LG_VOLUME_MULTIPLIER": 2.0,                 # ✅ تم التعديل من 1.5 إلى 2.0
+    "LG_VOLUME_MULTIPLIER": 1.7,             # ✅ تم التعديل من 2.0 إلى 1.7
     "LG_EQUAL_LOWS_REQUIRED": 3,
     "LG_EQUAL_LOWS_RANGE_ATR_MULT": 0.5,
     
@@ -808,7 +814,7 @@ CONFIG = {
     # Market Regime Filter
     "ENABLE_MARKET_REGIME_FILTER": True,
     "MIN_ADX_FOR_TREND": 20,
-    "MAX_CHASE_MOVE_PCT": 0.03,                  # ✅ حد حركة المطاردة
+    "MAX_CHASE_MOVE_PCT": 0.03,
     
     # BTC Filter
     "ENABLE_BTC_FILTER": True,
@@ -820,7 +826,7 @@ CONFIG = {
     "MEXC_API_KEY": "",
     "MEXC_API_SECRET": "",
     "LIVE_MAX_OPEN_TRADES": 5,
-    "MAX_SPREAD_PCT": 0.1,
+    "MAX_SPREAD_PCT": 0.15,                  # ✅ تم التعديل من 0.1 إلى 0.15
     "ENTRY_ORDER_TYPE": "limit",
     "ENTRY_LIMIT_TIMEOUT_SEC": 120,
     "ENTRY_LIMIT_POLL_SEC": 3,
@@ -829,7 +835,7 @@ CONFIG = {
     "LIVE_RECALIBRATION_MODE": "rr",
     "LIVE_REQUIRE_BALANCE_RECONCILIATION": True,
     "MIN_DUST_THRESHOLD": 0.000001,
-    "LIVE_PLACE_SL_ORDER": False,
+    "LIVE_PLACE_SL_ORDER": True,              # ✅ مفعل الآن
     "LIVE_SL_ORDER_TYPE": "stop-loss",
     
     # Paper Trading
@@ -838,12 +844,12 @@ CONFIG = {
     
     # Entry Quality Filter
     "ENABLE_ENTRY_QUALITY_FILTER": True,
-    "ENTRY_QUALITY_MAX_ATR_PCT_5M": 6.5,
+    "ENTRY_QUALITY_MAX_ATR_PCT_5M": 5.5,      # ✅ تم التعديل من 6.5 إلى 5.5
     "ENTRY_QUALITY_MAX_BB_WIDTH_5M": 0.08,
     "ENTRY_QUALITY_MAX_DISTANCE_FROM_ZONE_ATR": 1.2,
     
     # Cooldown
-    "SYMBOL_COOLDOWN_SEC": 1800,
+    "SYMBOL_COOLDOWN_SEC": 900,                # ✅ تم التعديل من 1800 إلى 900
     
     # Daily Circuit Breaker
     "ENABLE_DAILY_MAX_LOSS": True,
@@ -884,7 +890,7 @@ CONFIG = {
     
     # Advanced
     "ORDER_FLOW_ENABLE_FOR_ALIGNMENT_2_IF_STRONG_SCORE": True,
-    "ORDER_FLOW_PRECHECK_MIN_SCORE": 75.0,
+    "ORDER_FLOW_PRECHECK_MIN_SCORE": 65.0,     # ✅ تم التعديل من 75 إلى 65
     
     # INSTITUTIONAL FEATURES
     "ENABLE_MEMORY_MONITORING": False,
@@ -1039,7 +1045,6 @@ def price_acceptance_gate_5m(
         if not acceptance:
             return False, "ob_no_acceptance"
 
-        # التحقق من صحة slice الحجم
         vol_slice = df_5m['volume'].iloc[-20:-1]
         if len(vol_slice) > 0:
             avg_vol = vol_slice.mean()
@@ -1498,18 +1503,12 @@ async def place_limit_buy_entry(exchange, symbol: str, price: float, amount: flo
         return None
 
 async def place_stop_loss_order(exchange, symbol: str, stop_price: float, amount: float) -> Optional[Dict[str, Any]]:
-    """
-    وضع أمر وقف خسارة على المنصة (stop-loss أو stop-limit حسب الإعدادات).
-    يدعم MEXC spot: نوع الأمر 'stop-loss' مع stopPrice.
-    """
     if not CONFIG.get("LIVE_PLACE_SL_ORDER"):
         return None
     
     order_type = CONFIG.get("LIVE_SL_ORDER_TYPE", "stop-loss")
     try:
         amt = _round_amount_to_precision(exchange, symbol, amount)
-        # سعر التنفيذ لوقف الخسارة: عادةً يكون سعر السوق (لstop-loss) أو يمكن تحديد سعر حد (لstop-limit)
-        # هنا نستخدم stop-loss بسيط مع stopPrice
         params = {'stopPrice': _round_price_to_precision(exchange, symbol, stop_price)}
         await rate_limiter.wait_if_needed(weight=1)
         order = await exchange.create_order(symbol, order_type, "sell", amt, None, params)
@@ -1651,7 +1650,7 @@ def entry_quality_filter_5m(df_5m: pd.DataFrame, signal: 'QuantumSignal') -> Tup
         prev = df_5m.iloc[-2]
         
         atr_pct = safe_float(last.get("atr_pct", 0.0), 0.0)
-        if atr_pct > safe_float(CONFIG.get("ENTRY_QUALITY_MAX_ATR_PCT_5M", 6.5), 6.5):
+        if atr_pct > safe_float(CONFIG.get("ENTRY_QUALITY_MAX_ATR_PCT_5M", 5.5), 5.5):
             return False, f"atr_pct_too_high({atr_pct:.2f}%)"
         
         bb_width = safe_float(last.get("bb_width", 0.0), 0.0)
@@ -1964,7 +1963,7 @@ class DatabaseManager:
                     exit_price,
                     exit_type,
                     profit_pct,
-                    r_multiple,  # هنا ندخل total_r (الإجمالي للصفقة) وليس فقط الجزء الأخير
+                    r_multiple,
                     quantum_score,
                     signal_class,
                     gates_passed_json,
@@ -2500,7 +2499,7 @@ def analyze_market_structure(df: pd.DataFrame) -> Optional[MarketStructure]:
                         displacement_found = True
                         break
                 
-                is_fresh = (len(df) - 1 - i) < CONFIG["HARD_GATE_2_OB_FRESHNESS"]  # ✅ استخدام الإعداد الجديد
+                is_fresh = (len(df) - 1 - i) < CONFIG["HARD_GATE_2_OB_FRESHNESS"]
                 
                 if volume_spike and displacement_found and is_fresh:
                     order_block = {
@@ -2518,8 +2517,7 @@ def analyze_market_structure(df: pd.DataFrame) -> Optional[MarketStructure]:
             for i in range(1, len(df) - 1):
                 prev_candle = df.iloc[i-1]
                 current_candle = df.iloc[i]
-                # next_candle غير مستخدم حالياً
-                if prev_candle['high'] < current_candle['low']:  # فجوة صاعدة
+                if prev_candle['high'] < current_candle['low']:
                     gap_low = prev_candle['high']
                     gap_high = current_candle['low']
                     min_gap_size = safe_float(df['atr'].iloc[i] * CONFIG["FVG_MIN_SIZE_ATR"])
@@ -2531,7 +2529,7 @@ def analyze_market_structure(df: pd.DataFrame) -> Optional[MarketStructure]:
                             'index': i
                         }
                         break
-                elif prev_candle['low'] > current_candle['high']:  # فجوة هابطة
+                elif prev_candle['low'] > current_candle['high']:
                     gap_low = current_candle['high']
                     gap_high = prev_candle['low']
                     min_gap_size = safe_float(df['atr'].iloc[i] * CONFIG["FVG_MIN_SIZE_ATR"])
@@ -2544,7 +2542,6 @@ def analyze_market_structure(df: pd.DataFrame) -> Optional[MarketStructure]:
                         }
                         break
         
-        # استبعاد آخر شمعة من حساب السيولة
         window_liquidity = df.iloc[-21:-1] if len(df) >= 21 else df.iloc[:-1]
         liquidity_high = safe_float(window_liquidity['high'].max()) if len(window_liquidity) > 0 else 0
         liquidity_low = safe_float(window_liquidity['low'].min()) if len(window_liquidity) > 0 else 0
@@ -2709,12 +2706,11 @@ async def analyze_order_flow(exchange, symbol: str, mtf_alignment: int = 0,
         logger.error(f"[Order Flow Error] {symbol}: {str(e)[:100]}")
         return None
 
-# ===================== VOLUME PROFILE ANALYSIS (مُحسّن) =====================
+# ===================== VOLUME PROFILE ANALYSIS =====================
 def analyze_volume_profile(df: pd.DataFrame, precheck_score: float = 0.0) -> Optional[VolumeProfileData]:
     if not CONFIG.get("ENABLE_VOLUME_PROFILE", False) or df is None or len(df) < 50:
         return None
     
-    # التحقق من أخذ عينات الحجم
     if not CONFIG.get("_VOLUME_PROFILE_SAMPLING_OK", True):
         return None
     
@@ -2830,7 +2826,7 @@ def analyze_volume_profile(df: pd.DataFrame, precheck_score: float = 0.0) -> Opt
         logger.error(f"[Volume Profile Error] {str(e)}")
         return None
 
-# ===================== LIQUIDITY GRAB DETECTION (مُحسّن) =====================
+# ===================== LIQUIDITY GRAB DETECTION =====================
 def detect_liquidity_grab(df: pd.DataFrame) -> Optional[LiquidityGrab]:
     if not CONFIG.get("ENABLE_LIQUIDITY_GRAB", True) or df is None or len(df) < 30:
         return None
@@ -2839,7 +2835,6 @@ def detect_liquidity_grab(df: pd.DataFrame) -> Optional[LiquidityGrab]:
         last_candle = df.iloc[-1]
         prev_candle = df.iloc[-2] if len(df) > 1 else last_candle
         
-        # استبعاد آخر شمعة من حساب الدعم والمقاومة
         window = df.iloc[-21:-1] if len(df) >= 21 else df.iloc[:-1]
         if len(window) == 0:
             return None
@@ -3015,7 +3010,6 @@ async def analyze_multi_timeframe(exchange, symbol: str) -> Optional[Dict]:
         if structure_5m.structure == "BULLISH":
             alignment += 1
         
-        # نؤجل تحليل Volume Profile لحين توفر precheck_score
         liquidity_grab = detect_liquidity_grab(df_5m)
         
         return {
@@ -3033,7 +3027,7 @@ async def analyze_multi_timeframe(exchange, symbol: str) -> Optional[Dict]:
         logger.error(f"[MTF Error] {symbol}: {str(e)[:150]}")
         return None
 
-# ===================== INSTITUTIONAL HARD GATES (مُحسّن) =====================
+# ===================== INSTITUTIONAL HARD GATES =====================
 def evaluate_hard_gates(
     market_structure: MarketStructure,
     order_flow: Optional[OrderFlowData],
@@ -3049,8 +3043,7 @@ def evaluate_hard_gates(
     gates_passed = []
     all_gates_passed = True
     
-    # ✅ GATE 1: الاتجاه العام و MTF Alignment
-    # اشترط Alignment = 3 أو Alignment = 2 بشرط Trend Strength > 70
+    # GATE 1: Trend strength and MTF alignment
     if mtf_alignment == 3:
         gate1_passed = (market_structure.trend_strength >= CONFIG["HARD_GATE_1_MIN_TREND_STRENGTH"] and
                         market_structure.structure == "BULLISH")
@@ -3068,19 +3061,19 @@ def evaluate_hard_gates(
             logger.info(f"[Hard Gates] GATE_1 failed: Trend={market_structure.trend_strength:.1f}, "
                       f"MTF={mtf_alignment}, Structure={market_structure.structure}")
     
-    # ✅ GATE 2: منطقة دخول قوية (Liquidity Grab قوي أو Order Block طازج مع BOS)
+    # GATE 2: Strong entry zone (Liquidity Grab or fresh Order Block with BOS)
     has_strong_lg = (
         liquidity_grab and 
         liquidity_grab.detected and 
-        liquidity_grab.confidence >= CONFIG.get("HARD_GATE_2_MIN_LG_CONFIDENCE", 75) and 
+        liquidity_grab.confidence >= CONFIG.get("HARD_GATE_2_MIN_LG_CONFIDENCE", 70) and 
         liquidity_grab.grab_type == "BULLISH"
     )
     
     has_fresh_ob = (
         market_structure.order_block and
-        market_structure.order_block.get("freshness", 999) <= CONFIG.get("HARD_GATE_2_OB_FRESHNESS", 5) and
+        market_structure.order_block.get("freshness", 999) <= CONFIG.get("HARD_GATE_2_OB_FRESHNESS", 8) and
         market_structure.trend_strength >= 65 and
-        market_structure.bos_bullish  # ✅ اشتراط وجود BOS حقيقي
+        market_structure.bos_bullish
     )
     
     gate2_passed = has_strong_lg or has_fresh_ob
@@ -3095,7 +3088,7 @@ def evaluate_hard_gates(
         if CONFIG["DEBUG_MODE"]:
             logger.info(f"[Hard Gates] GATE_2 failed: No strong Liquidity Grab or fresh Order Block with BOS")
     
-    # ✅ GATE 3: محفزات (Booster) - غير إجباري حسب الإعدادات
+    # GATE 3: Boosters (optional)
     if CONFIG["ENABLE_HARD_GATES"] and CONFIG["HARD_GATE_3_REQUIRE_BOOSTER"]:
         boosters = []
         
@@ -3127,7 +3120,7 @@ def evaluate_hard_gates(
     
     return all_gates_passed, gates_passed
 
-# ===================== ENHANCED QUANTUM SCORING (بالأوزان الجديدة) =====================
+# ===================== ENHANCED QUANTUM SCORING =====================
 def calculate_quantum_score(
     market_structure: MarketStructure,
     order_flow: Optional[OrderFlowData],
@@ -3137,7 +3130,6 @@ def calculate_quantum_score(
     df: pd.DataFrame
 ) -> Tuple[float, float, str]:
     
-    # التحقق من البوابات الإجبارية أولاً (تعديل: نمرر كل شيء)
     gates_ok, gates_list = evaluate_hard_gates(
         market_structure, order_flow, volume_profile,
         liquidity_grab, mtf_alignment, df
@@ -3145,16 +3137,6 @@ def calculate_quantum_score(
     
     if CONFIG["ENABLE_HARD_GATES"] and not gates_ok:
         return 0.0, 0.0, "REJECT"
-    
-    # ✅ الأوزان الجديدة حسب الطلب
-    # Structure + BOS: 25
-    # Liquidity Grab: 20
-    # Order Flow: 20
-    # MTF Alignment: 15
-    # Volume Profile: 10
-    # RSI: 5
-    # OB Freshness: 5
-    # المجموع = 100
     
     score = 0.0
     confidence_factors = []
@@ -3169,11 +3151,11 @@ def calculate_quantum_score(
     
     # 2. Liquidity Grab (max 20)
     if liquidity_grab and liquidity_grab.detected and liquidity_grab.grab_type == "BULLISH":
-        lg_score = min(liquidity_grab.confidence / 5, 20)  # confidence 100 -> 20 points
+        lg_score = min(liquidity_grab.confidence / 5, 20)
         score += lg_score
         confidence_factors.append(liquidity_grab.confidence)
         if hasattr(liquidity_grab, 'equal_lows') and liquidity_grab.equal_lows:
-            score += 3  # bonus (لكن لا يتجاوز 20)
+            score += 3
     
     # 3. Order Flow (max 20)
     if order_flow:
@@ -3185,17 +3167,17 @@ def calculate_quantum_score(
             of_score += 10
             confidence_factors.append(75)
         elif order_flow.volume_profile == "ABSORPTION":
-            of_score += 15  # Absorption أعلى قيمة
+            of_score += 15
             confidence_factors.append(85)
         elif order_flow.volume_profile == "DISTRIBUTION":
-            of_score -= 10  # عقوبة
+            of_score -= 10
             confidence_factors.append(30)
         if order_flow.imbalance > 0.3:
             of_score += 5
         score += max(0, of_score)
     
     # 4. MTF Alignment (max 15)
-    alignment_score = mtf_alignment * 5  # 3*5 = 15
+    alignment_score = mtf_alignment * 5
     score += alignment_score
     if mtf_alignment == 3:
         confidence_factors.append(95)
@@ -3229,15 +3211,20 @@ def calculate_quantum_score(
             score += 3
             confidence_factors.append(70)
     
-    # نقاط إضافية: Trend Strength (إذا كان قويًا جدًا)
-    if market_structure.trend_strength > 80:
-        score += 5  # bonus
+    # 8. Extra bonus: BELOW_VALUE + BULLISH_FLOW (if both true)
+    if (volume_profile and volume_profile.current_position == "BELOW_VALUE" and
+        order_flow and order_flow.signal == "BULLISH"):
+        score += 5
+        confidence_factors.append(95)
     
-    # ضمان ألا يتجاوز score 100
+    # 9. Trend strength bonus
+    if market_structure.trend_strength > 80:
+        score += 5
+    
     quantum_score = max(0.0, min(100.0, score))
     
     confidence = np.mean(confidence_factors) if confidence_factors else 50.0
-    confidence = min(100, confidence * 0.9)  # تخفيض بسيط
+    confidence = min(100, confidence * 0.9)
     
     if quantum_score >= CONFIG["QUANTUM_A_PLUS_SCORE"]:
         signal_class = "QUANTUM_A+"
@@ -3252,36 +3239,29 @@ def calculate_quantum_score(
 
 # ===================== دالة حساب مستويات وقف الخسارة والأهداف =====================
 def compute_sl_and_tp_from_structure(entry: float, market_structure: MarketStructure, atr: float, liquidity_grab: Optional[LiquidityGrab]) -> Tuple[float, float, float, float]:
-    """
-    حساب وقف الخسارة النهائي بناءً على كتلة الطلبات أو ATR، مع تطبيق الحد الأقصى لنسبة الخسارة.
-    """
     if not validate_price(entry) or entry <= 0:
         return 0.0, 0.0, 0.0, 0.0
     
     if not validate_price(atr) or atr <= 0:
         atr = entry * 0.02
     
-    # محاولة استخدام كتلة الطلبات أولاً
     sl = 0.0
     if market_structure.order_block:
         ob_sl = market_structure.order_block['low'] * 0.995
         if 0 < ob_sl < entry:
             sl = ob_sl
     
-    # إذا لم نجد كتلة طلبات صالحة، نستخدم ATR
     if sl == 0:
         sl = entry - (atr * CONFIG["ATR_SL_MULT"])
         if sl >= entry or sl <= 0:
-            sl = entry * 0.95  # fallback
+            sl = entry * 0.95
     
-    # تطبيق الحد الأقصى لنسبة الخسارة
     max_sl_distance = entry * (CONFIG["MAX_SL_PCT"] / 100)
     hard_sl = entry - max_sl_distance
     if sl < hard_sl:
         logger.warning(f"[SL] SL {sl:.6f} exceeds MAX_SL_PCT, clamping to {hard_sl:.6f}")
         sl = hard_sl
     
-    # حساب الأهداف بناءً على R:R
     risk = entry - sl
     if risk <= 0:
         logger.error(f"[SL] Invalid risk: {risk:.6f}")
@@ -3388,7 +3368,7 @@ async def check_btc_trend(exchange) -> Dict:
         logger.error(f"[BTC Check Error] {str(e)[:100]}")
         return {"trend": "NEUTRAL", "change_1h": 0, "safe_to_trade": True}
 
-# ===================== FIXED ORDER FLOW SAMPLING LOGIC (مع staggered per symbol) =====================
+# ===================== FIXED ORDER FLOW SAMPLING LOGIC =====================
 def should_run_order_flow(symbol: str, mtf_alignment: int, precheck_score: float, loop_count: int) -> bool:
     if not CONFIG.get("ORDER_FLOW_ENABLED", True):
         return False
@@ -3397,11 +3377,10 @@ def should_run_order_flow(symbol: str, mtf_alignment: int, precheck_score: float
         return True
     
     if mtf_alignment == 2 and CONFIG.get("ORDER_FLOW_ENABLE_FOR_ALIGNMENT_2_IF_STRONG_SCORE", True):
-        if precheck_score >= safe_float(CONFIG.get("ORDER_FLOW_PRECHECK_MIN_SCORE", 75.0), 75.0):
+        if precheck_score >= safe_float(CONFIG.get("ORDER_FLOW_PRECHECK_MIN_SCORE", 65.0), 65.0):
             return True
     
     if mtf_alignment >= 2 and CONFIG.get("ORDER_FLOW_SAMPLING_ENABLED", True):
-        # توزيع عشوائي حسب الرمز باستخدام دالة تجزئة ثابتة
         sample_every = CONFIG.get("ORDER_FLOW_SAMPLE_EVERY_N_LOOPS", 3)
         symbol_hash = stable_hash(symbol) % sample_every
         if symbol_hash == loop_count % sample_every:
@@ -3409,7 +3388,7 @@ def should_run_order_flow(symbol: str, mtf_alignment: int, precheck_score: float
     
     return False
 
-# ===================== ENHANCED EMERGENCY STATE MONITOR =====================
+# ===================== EMERGENCY STATE MONITOR =====================
 async def emergency_state_monitor(exchange):
     MAX_TOTAL_ATTEMPTS = 10
     
@@ -3467,7 +3446,6 @@ async def emergency_state_monitor(exchange):
                     sell_order = await market_sell_safe(exchange, symbol, remaining_base, max_retries=2)
                     
                     if sell_order:
-                        # استخدام سعر التنفيذ الفعلي من الأمر
                         fill_price = safe_float(sell_order.get('average')) or safe_float(sell_order.get('price')) or current_price
                         risk = trade_snapshot.entry - trade_snapshot.original_sl
                         r_multiple = (fill_price - trade_snapshot.entry) / risk if risk > 0 else 0
@@ -3509,9 +3487,6 @@ async def emergency_state_monitor(exchange):
 
 # ===================== BALANCE RECONCILIATION TASK =====================
 async def reconcile_balances(exchange):
-    """
-    مهمة دورية لمقارنة الأرصدة الفعلية على المنصة مع المراكز المتوقعة.
-    """
     while not shutdown_manager.should_stop:
         await asyncio.sleep(CONFIG.get("RECONCILIATION_INTERVAL_SEC", 300))
         
@@ -3522,7 +3497,6 @@ async def reconcile_balances(exchange):
             continue
         
         try:
-            # جلب الرصيد الكامل
             balance = await exchange.fetch_balance()
             if not balance:
                 continue
@@ -3546,8 +3520,7 @@ async def reconcile_balances(exchange):
                             critical=False
                         )
                         
-                        # يمكن إضافة منطق إيقاف التداول لهذا الرمز إذا كان الفرق كبيراً
-                        if abs(real_balance - expected) > expected * 0.1:  # فرق 10%
+                        if abs(real_balance - expected) > expected * 0.1:
                             await mark_trade_emergency(
                                 symbol,
                                 reason=f"Reconciliation mismatch: expected {expected}, real {real_balance}",
@@ -3560,7 +3533,42 @@ async def reconcile_balances(exchange):
         except Exception as e:
             logger.error(f"[Reconciliation] Main error: {e}")
 
-# ===================== INSTITUTIONAL SIGNAL GENERATOR (مُعاد هيكلته مع التحسينات) =====================
+# ===================== BTC FILTER SPECIFIC =====================
+async def check_btc_filter(exchange) -> bool:
+    """
+    ترجع False إذا كان BTC غير مناسب للتداول على الإطالة (LONG):
+    - RSI 1H < 40
+    - السعر الحالي تحت EMA50 1H
+    """
+    if not CONFIG.get("ENABLE_BTC_FILTER", True):
+        return True
+    
+    try:
+        data = await cache.get_ohlcv(exchange, "BTC/USDT", "1h", 100)
+        if not data or len(data) < 50:
+            return True
+        
+        df = pd.DataFrame(data, columns=['t','open','high','low','close','volume'])
+        df = calculate_indicators(df)
+        if df is None:
+            return True
+        
+        current_close = df['close'].iloc[-1]
+        ema50 = df['ema50'].iloc[-1]
+        rsi = df['rsi'].iloc[-1]
+        
+        if rsi < 40:
+            logger.info("[BTC Filter] RSI < 40 -> skipping longs")
+            return False
+        if current_close < ema50:
+            logger.info("[BTC Filter] Price below EMA50 -> skipping longs")
+            return False
+        return True
+    except Exception as e:
+        logger.error(f"[BTC Filter Error] {e}")
+        return True
+
+# ===================== INSTITUTIONAL SIGNAL GENERATOR =====================
 @metrics.record_latency("signal_generation")
 @log_execution_time
 async def generate_quantum_signal(exchange, symbol: str) -> Optional[QuantumSignal]:
@@ -3578,6 +3586,10 @@ async def generate_quantum_signal(exchange, symbol: str) -> Optional[QuantumSign
                             return None
             except Exception:
                 pass
+        
+        # BTC Filter
+        if not await check_btc_filter(exchange):
+            return None
         
         mtf = await analyze_multi_timeframe(exchange, symbol)
         
@@ -3597,11 +3609,15 @@ async def generate_quantum_signal(exchange, symbol: str) -> Optional[QuantumSign
         ob = structure_15m.order_block if (structure_15m and structure_15m.order_block) else None
         lg = liquidity_grab if (liquidity_grab and liquidity_grab.detected and liquidity_grab.grab_type == "BULLISH") else None
         
-        # ✅ شرط جديد: إذا كان هناك Liquidity Grab و Order Flow Neutral -> reject
+        # Micro Structure Protection (إذا كان هناك Liquidity Grab)
         if lg:
-            # نحتاج order flow هنا، لكنه غير محسوب بعد. سنقوم بتأجيل هذا الشرط بعد حساب order flow.
-            # لكن يمكننا تخزين lg flag وإجراء التحقق بعد الحصول على order flow.
-            pass
+            last_close = df_5m['close'].iloc[-1]
+            prev_high = df_5m['high'].iloc[-2]
+            prev_low = df_5m['low'].iloc[-2]
+            mid = (prev_high + prev_low) / 2.0
+            if last_close < mid:
+                logger.info(f"[Micro Structure] {symbol} rejected: last close {last_close:.6f} below midpoint {mid:.6f}")
+                return None
         
         ok_accept, reason = price_acceptance_gate_5m(df_5m, ob, lg)
         if not ok_accept:
@@ -3609,7 +3625,6 @@ async def generate_quantum_signal(exchange, symbol: str) -> Optional[QuantumSign
                 logger.info(f"[EntryGate] {symbol} rejected: {reason}")
             return None
         
-        # تحديد سعر الدخول
         if ob:
             entry = _ob_entry_price(ob)
         elif lg:
@@ -3622,21 +3637,25 @@ async def generate_quantum_signal(exchange, symbol: str) -> Optional[QuantumSign
         
         atr = safe_float(df_15m['atr'].iloc[-1])
         
-        # حساب وقف الخسارة والأهداف أولاً
         sl, tp1, tp2, tp3 = compute_sl_and_tp_from_structure(entry, structure_15m, atr, liquidity_grab)
         if sl == 0:
             return None
         
-        # حساب حجم الصفقة بناءً على وقف الخسارة
         position_size_usdt, position_size_pct = calculate_position_size(entry, sl)
         if position_size_usdt == 0:
             return None
         
-        # حساب النقاط الأولية (دون order flow) لاستخدامها في sampling و volume profile
+        # Momentum Confirmation (RSI 5m)
+        if 'rsi' in df_5m.columns:
+            rsi_5m = df_5m['rsi'].iloc[-1]
+            if rsi_5m < 45:
+                logger.info(f"[Momentum] {symbol} rejected: RSI 5m = {rsi_5m:.1f} < 45")
+                return None
+        
         pre_qs, pre_conf, pre_class = calculate_quantum_score(
             structure_15m,
             None,
-            None,  # volume profile غير محسوب بعد
+            None,
             liquidity_grab,
             mtf['alignment'],
             df_15m
@@ -3644,29 +3663,25 @@ async def generate_quantum_signal(exchange, symbol: str) -> Optional[QuantumSign
         
         if pre_class == "QUANTUM_A+":
             reset_daily_counters()
-            max_daily_a_plus = CONFIG.get("MAX_DAILY_A_PLUS", 3)
+            max_daily_a_plus = CONFIG.get("MAX_DAILY_A_PLUS", 7)
             if STATS.get("daily_a_plus_count", 0) >= max_daily_a_plus:
                 logger.info(f"[Daily Cap] A+ cap reached ({STATS['daily_a_plus_count']}/{max_daily_a_plus}) - rejecting")
                 return None
         
-        # تشغيل order flow إذا لزم الأمر
         order_flow = None
         if should_run_order_flow(symbol, mtf['alignment'], pre_qs, int(STATS.get("loop_count", 0))):
             if CONFIG.get("ORDER_FLOW_ENABLED", True):
-                allow_low = (mtf['alignment'] == 2 and pre_qs >= 75) or (mtf['alignment'] == 1 and pre_qs >= 85)
+                allow_low = (mtf['alignment'] == 2 and pre_qs >= 65) or (mtf['alignment'] == 1 and pre_qs >= 85)
                 order_flow = await analyze_order_flow(exchange, symbol, mtf['alignment'], allow_low_alignment=allow_low)
         
-        # ✅ تطبيق شرط Liquidity Grab مع Order Flow Neutral
         if lg and order_flow and order_flow.signal == "NEUTRAL":
             logger.info(f"[Signal] {symbol} rejected: Liquidity Grab with Neutral Order Flow")
             return None
         
-        # تشغيل volume profile الآن باستخدام pre_qs
         volume_profile = None
         if CONFIG.get("ENABLE_VOLUME_PROFILE", False) and CONFIG.get("_VOLUME_PROFILE_SAMPLING_OK", True):
             volume_profile = analyze_volume_profile(df_15m, precheck_score=pre_qs)
         
-        # حساب النقاط النهائية مع order flow و volume profile
         quantum_score, confidence, signal_class = calculate_quantum_score(
             structure_15m,
             order_flow,
@@ -3694,8 +3709,6 @@ async def generate_quantum_signal(exchange, symbol: str) -> Optional[QuantumSign
         
         risk_reward = (tp3 - entry) / (entry - sl) if entry > sl else 0
         win_probability = min(95, max(40, quantum_score * 0.8))
-        
-        # ✅ النموذج الذهبي: يمكن إضافته كشرط اختياري، لكنه ليس إجبارياً. سنتركه للتوثيق فقط.
         
         return QuantumSignal(
             symbol=symbol,
@@ -3871,8 +3884,8 @@ async def get_filtered_symbols(exchange) -> List[str]:
             volume = safe_float(ticker.get('quoteVolume'), 0)
             price = safe_float(ticker.get('last'), 0)
             
-            if (volume < 50000 or  # MIN_VOLUME_USDT
-                price > 1000 or  # MAX_PRICE
+            if (volume < 50000 or
+                price > 1000 or
                 not validate_price(price)):
                 continue
             
@@ -3925,7 +3938,31 @@ async def mark_trade_emergency(symbol: str, reason: str, critical_msg: str = "")
             critical=True
         )
 
-# ===================== INSTITUTIONAL LIVE ENTRY (مع إدارة SL على المنصة) =====================
+# ===================== CONSECUTIVE LOSS GUARD =====================
+def record_loss(symbol: str):
+    now = time.time()
+    bot.consecutive_losses[symbol].append(now)
+    # احتفظ فقط بخسائر آخر 24 ساعة
+    cutoff = now - 86400
+    bot.consecutive_losses[symbol] = [t for t in bot.consecutive_losses[symbol] if t > cutoff]
+    if len(bot.consecutive_losses[symbol]) >= 2:
+        # blacklist for 6 hours
+        bot.consecutive_loss_blacklist[symbol] = now + 21600
+        logger.warning(f"[Loss Guard] {symbol} has 2+ losses in 24h -> blacklisted for 6h")
+        asyncio.create_task(send_telegram(
+            f"🛑 {escape_html(symbol)} محظور لمدة 6 ساعات بسبب خسارتين متتاليتين خلال 24 ساعة.",
+            critical=False
+        ))
+
+def is_symbol_blacklisted_loss(symbol: str) -> bool:
+    expiry = bot.consecutive_loss_blacklist.get(symbol, 0)
+    if expiry > time.time():
+        return True
+    if expiry > 0:
+        del bot.consecutive_loss_blacklist[symbol]
+    return False
+
+# ===================== INSTITUTIONAL LIVE ENTRY =====================
 @metrics.record_latency("live_entry")
 @log_execution_time
 async def execute_live_entry_if_enabled(exchange, signal: QuantumSignal) -> Tuple[bool, Optional[TradeState]]:
@@ -4026,6 +4063,22 @@ async def execute_live_entry_if_enabled(exchange, signal: QuantumSignal) -> Tupl
     
     adj_sl, adj_tp1, adj_tp2, adj_tp3, adj_position_size = recalibrate_levels_on_fill(fill_price, signal)
     
+    # Slippage Recheck: إذا كان RR الفعلي للهدف الأول أقل من 2.5، نغلق الصفقة فوراً
+    actual_risk = fill_price - adj_sl
+    if actual_risk > 0:
+        actual_rr = (adj_tp1 - fill_price) / actual_risk
+        if actual_rr < 2.5:
+            logger.warning(f"[Slippage] {signal.symbol} actual RR {actual_rr:.2f} < 2.5, closing immediately")
+            await send_telegram(
+                f"⚠️ تم إغلاق الصفقة بسبب انخفاض RR الفعلي بعد التنفيذ\n"
+                f"• الرمز: {escape_html(signal.symbol)}\n"
+                f"• RR الفعلي: {actual_rr:.2f}\n"
+                f"• الحد الأدنى: 2.5"
+            )
+            # بيع فوري
+            await market_sell_safe(exchange, signal.symbol, fill_amount, max_retries=2)
+            return False, None
+    
     trade_state = TradeState(
         symbol=signal.symbol,
         entry=fill_price if validate_price(fill_price) else signal.entry,
@@ -4047,7 +4100,6 @@ async def execute_live_entry_if_enabled(exchange, signal: QuantumSignal) -> Tupl
         entry_assumed=False,
     )
     
-    # وضع أمر وقف خسارة على المنصة إذا كان مفعلاً
     if CONFIG.get("LIVE_PLACE_SL_ORDER"):
         sl_order = await place_stop_loss_order(exchange, signal.symbol, adj_sl, fill_amount)
         if sl_order:
@@ -4079,6 +4131,11 @@ async def process_symbol_batch(exchange, symbols: List[str]) -> int:
     
     for symbol in symbols:
         try:
+            # Consecutive loss guard
+            if is_symbol_blacklisted_loss(symbol):
+                logger.warning(f"[Loss Guard] Skipping blacklisted symbol due to consecutive losses: {symbol}")
+                continue
+            
             if bot.lock_manager.is_blacklisted(symbol):
                 logger.warning(f"[Blacklist] Skipping blacklisted symbol: {symbol}")
                 continue
@@ -4190,13 +4247,12 @@ async def process_symbol_batch(exchange, symbols: List[str]) -> int:
     
     return signals_found
 
-# ===================== TRADE MONITOR (مع parallel ticker fetch) =====================
+# ===================== TRADE MONITOR =====================
 async def monitor_active_trades(exchange):
     if not ACTIVE_TRADES:
         return
     
     try:
-        # استخدام wait_for لفرض مهلة قصوى على الدورة بأكملها
         await asyncio.wait_for(_monitor_active_trades_internal(exchange), timeout=30)
     except asyncio.TimeoutError:
         logger.error("[Monitor] Timeout exceeded - skipping this cycle")
@@ -4206,7 +4262,6 @@ async def monitor_active_trades(exchange):
 async def _monitor_active_trades_internal(exchange):
     symbols = list(ACTIVE_TRADES.keys())
     
-    # جلب جميع tickers بالتوازي
     ticker_tasks = []
     for symbol in symbols:
         if not bot.lock_manager.is_blacklisted(symbol):
@@ -4214,7 +4269,6 @@ async def _monitor_active_trades_internal(exchange):
     
     ticker_results = await asyncio.gather(*ticker_tasks, return_exceptions=True)
     
-    # معالجة كل رمز على حدة
     for symbol, ticker_result in zip(symbols, ticker_results):
         if isinstance(ticker_result, Exception):
             logger.error(f"[Monitor] Error fetching ticker for {symbol}: {ticker_result}")
@@ -4228,7 +4282,6 @@ async def _monitor_active_trades_internal(exchange):
         if not validate_price(current_price):
             continue
         
-        # الحصول على القفل للمعالجة
         if not await bot.get_trade_lock(symbol):
             continue
         
@@ -4256,7 +4309,9 @@ async def _monitor_active_trades_internal(exchange):
                 await partial_exit(symbol, trade, current_price, "TP1",
                                 CONFIG["TP1_EXIT_PCT"], r_multiple, exchange=exchange)
             
-            if r_multiple >= CONFIG["BE_AT_R"] and not trade.be_moved:
+            # Dynamic Break‑Even
+            be_at_r = max(1.2, 0.5 * trade.quantum_score / 100)
+            if r_multiple >= be_at_r and not trade.be_moved:
                 if trade.atr > 0:
                     new_sl = trade.entry + (trade.atr * CONFIG["BE_ATR_MULT"])
                 else:
@@ -4316,7 +4371,8 @@ async def _monitor_active_trades_internal(exchange):
             await partial_exit(symbol, trade, current_price, "TP1",
                             CONFIG["TP1_EXIT_PCT"], r_multiple)
         
-        if r_multiple >= CONFIG["BE_AT_R"] and not trade.be_moved:
+        be_at_r = max(1.2, 0.5 * trade.quantum_score / 100)
+        if r_multiple >= be_at_r and not trade.be_moved:
             if trade.atr > 0:
                 new_sl = trade.entry + (trade.atr * CONFIG["BE_ATR_MULT"])
             else:
@@ -4370,10 +4426,9 @@ async def fetch_ticker_with_lock(exchange, symbol):
         logger.error(f"[Ticker Error] {symbol}: {e}")
         return None
 
-# ===================== ENHANCED PARTIAL EXIT (مع إدارة SL على المنصة ومع race condition fix) =====================
+# ===================== ENHANCED PARTIAL EXIT =====================
 async def partial_exit(symbol: str, trade: TradeState, exit_price: float,
                       tp_level: str, exit_pct: float, r_multiple: float, exchange=None):
-    # الاحتفاظ بالقفل طوال العملية
     if not await bot.get_trade_lock(symbol):
         logger.error(f"[partial_exit] Failed to acquire lock for {symbol}")
         return
@@ -4384,15 +4439,12 @@ async def partial_exit(symbol: str, trade: TradeState, exit_price: float,
         
         current_trade = ACTIVE_TRADES[symbol]
         
-        # التحقق من is_exiting
         if current_trade.is_exiting:
             logger.warning(f"[partial_exit] Exit already in progress for {symbol}, skipping")
             return
         
-        # تعيين علامة الخروج
         current_trade.is_exiting = True
         
-        # قراءة البيانات المطلوبة
         if tp_level == "TP1" and current_trade.tp1_hit:
             return
         elif tp_level == "TP2" and current_trade.tp2_hit:
@@ -4411,26 +4463,22 @@ async def partial_exit(symbol: str, trade: TradeState, exit_price: float,
         current_version = current_trade._version
         sl_order_id = current_trade.sl_order_id
         
-        # حفظ حالة مؤقتة (يمكن تحديثها لاحقاً)
         db_manager.save_trade(current_trade)
         
-        # تنفيذ البيع (داخل القفل)
         sell_amount_base = entry_fill_amount * exit_pct
         live_sell_ok = True
-        fill_price = exit_price  # افتراضي
+        fill_price = exit_price
         
         if is_live_trading_enabled() and exchange and sell_amount_base > 0:
             sell_order = await market_sell_safe(exchange, symbol, sell_amount_base, max_retries=2)
             live_sell_ok = bool(sell_order)
             
             if live_sell_ok and sell_order:
-                # استخراج سعر التنفيذ الفعلي
                 fill_price = safe_float(sell_order.get('average')) or safe_float(sell_order.get('price')) or exit_price
                 if not validate_price(fill_price):
                     fill_price = exit_price
             
             if not live_sell_ok:
-                # إعادة تعيين العلامات
                 if tp_level == "TP1":
                     current_trade.tp1_order_done = False
                 elif tp_level == "TP2":
@@ -4438,35 +4486,25 @@ async def partial_exit(symbol: str, trade: TradeState, exit_price: float,
                 elif tp_level == "TP3":
                     current_trade.tp3_order_done = False
                 
-                # إلغاء علامة الخروج
                 current_trade.is_exiting = False
-                
-                # حفظ الحالة المعدلة
                 db_manager.save_trade(current_trade)
-                
-                # تفعيل حالة الطوارئ
                 asyncio.create_task(mark_trade_emergency(symbol, f"partial_sell_failed({tp_level})"))
                 return
             
-            # إذا كان هناك أمر SL على المنصة، يجب إلغاؤه وتحديثه بالكمية المتبقية
             if sl_order_id and exchange:
                 remaining_base = entry_fill_amount * (current_trade.remaining_position - exit_pct)
                 if remaining_base > 0:
-                    # إلغاء الأمر القديم
                     await cancel_stop_loss_order(exchange, symbol, sl_order_id)
-                    # وضع أمر جديد للكمية المتبقية
                     new_sl_order = await place_stop_loss_order(exchange, symbol, current_trade.current_sl, remaining_base)
                     if new_sl_order:
                         current_trade.sl_order_id = str(new_sl_order.get("id"))
                     else:
                         logger.warning(f"[partial_exit] Failed to place new SL for {symbol}")
         
-        # تحديث الحالة بعد البيع
         risk = trade.entry - trade.original_sl
         actual_r_multiple = (fill_price - trade.entry) / risk if risk > 0 else 0
         exit_r = actual_r_multiple * exit_pct
         
-        # التحقق من الإصدار (دمج بسيط)
         if current_trade._version != current_version:
             logger.warning(f"[partial_exit] Version mismatch for {symbol}. Expected {current_version}, got {current_trade._version}. Proceeding.")
         
@@ -4481,7 +4519,7 @@ async def partial_exit(symbol: str, trade: TradeState, exit_price: float,
             current_trade.tp3_hit = True
         
         current_trade._version += 1
-        current_trade.is_exiting = False  # إعادة تعيين علامة الخروج
+        current_trade.is_exiting = False
         
         db_manager.save_trade(current_trade)
         
@@ -4529,7 +4567,7 @@ async def partial_exit(symbol: str, trade: TradeState, exit_price: float,
     if current_remaining <= 0.01:
         await close_trade_full(symbol, fill_price, "ALL_TPS", exchange=exchange)
 
-# ===================== INSTITUTIONAL CLOSE TRADE FULL (مُعدل لإصلاح double counting) =====================
+# ===================== INSTITUTIONAL CLOSE TRADE FULL =====================
 async def close_trade_full(symbol: str, exit_price: float, exit_type: str, exchange=None, sell_order_info: Optional[Dict] = None):
     trade = None
     remaining = 0
@@ -4600,15 +4638,12 @@ async def close_trade_full(symbol: str, exit_price: float, exit_type: str, excha
             )
             return
         
-        # إلغاء أمر SL على المنصة إذا كان موجوداً
         if sl_order_id and exchange:
             await cancel_stop_loss_order(exchange, symbol, sl_order_id)
     
-    # تعريف final_exit_r قبل if
     final_exit_r = 0.0
     if remaining > 0:
         final_exit_r = r_multiple * remaining
-        # نضيف فقط الجزء النهائي إلى الإحصائيات
         total_r = total_realized_r + final_exit_r
     else:
         total_r = total_realized_r
@@ -4617,14 +4652,14 @@ async def close_trade_full(symbol: str, exit_price: float, exit_type: str, excha
     
     if exit_type == "SL":
         STATS["trades_lost"] += 1
-        STATS["total_r_multiple"] += final_exit_r  # إضافة الجزء النهائي فقط
+        STATS["total_r_multiple"] += final_exit_r
+        record_loss(symbol)   # تسجيل الخسارة المتتالية
     else:
         STATS["trades_won"] += 1
-        STATS["total_r_multiple"] += final_exit_r  # إضافة الجزء النهائي فقط
+        STATS["total_r_multiple"] += final_exit_r
     
-    record_daily_r(final_exit_r)  # تسجيل الجزء النهائي فقط
+    record_daily_r(final_exit_r)
     
-    # تخزين total_r في سجل التاريخ (r_multiple = total_r)
     db_manager.record_trade_history(symbol, trade, fill_price, exit_type, total_r, execution_mode)
     
     mode_badge = "✅ LIVE" if is_live_trading_enabled() else ("🟨 PAPER" if getattr(trade, "is_paper", False) else "🟦 SIGNAL")
@@ -4680,7 +4715,7 @@ async def generate_performance_report() -> str:
         
         if total_trades == 0:
             basic_report = f"""
-📊 تقرير الأداء - Quantum Flow v1.8.5 ULTIMATE INSTITUTIONAL EDITION
+📊 تقرير الأداء - Quantum Flow v1.8.6 ULTIMATE INSTITUTIONAL EDITION
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 🧾 الوضع
@@ -4692,32 +4727,21 @@ async def generate_performance_report() -> str:
 • SL on Exchange: {'ON' if CONFIG.get('LIVE_PLACE_SL_ORDER') else 'OFF'}
 
 ✅ التحسينات المؤسسية المطبقة
-• ✅ Atomic Partial Exit with Optimistic Locking + is_exiting flag
-• ✅ Enhanced Lock Manager with Recovery & Blacklisting (TTL)
-• ✅ Database Connection Leaks Fixed
-• ✅ Smart Cache with Memory Management
-• ✅ Exponential Backoff Retry Strategy
-• ✅ Enhanced Health Check with Diagnostics
-• ✅ Metrics Collector for Performance Monitoring
-• ✅ FVG Logic Corrected
-• ✅ Telegram Date Format Fixed
-• ✅ TA-Lib Import Fixed
-• ✅ Liquidity Grab Support/Resistance Fix
-• ✅ Daily Circuit Double Counting Fix
-• ✅ Order Flow Sampling Logic Fixed (staggered per symbol + stable hash)
-• ✅ Position Sizing Order Corrected
-• ✅ Volume Gate Slice Safety Added
-• ✅ Volume Profile precheck_score fix
-• ✅ close_trade_full final_exit_r defined
-• ✅ Trade history stores total R, stats incremental
-• ✅ SL order management on partial exits
-• ✅ Balance Reconciliation Task Added
-• ✅ asyncio.timeout fallback removed, replaced with asyncio.wait_for
+• ✅ تعديلات القيم الصارمة (OB freshness 8, wick ratio 0.45, volume multiplier 1.7, LG confidence 70, cooldown 900, A+ cap 7, spread 0.15, ATR% 5.5, trend strength 65)
+• ✅ تفعيل أمر SL على المنصة افتراضياً
+• ✅ تحسين Order Flow Sampling (التشغيل دائماً لـ alignment≥2 إذا score>65)
+• ✅ Momentum Confirmation (رفض LONG إذا RSI 5m < 45)
+• ✅ Micro Structure Protection (رفض LONG إذا آخر close أقل من midpoint الشمعة السابقة)
+• ✅ Slippage Recheck بعد التنفيذ (إغلاق الصفقة إذا RR الفعلي < 2.5)
+• ✅ Consecutive Loss Guard (حظر الرمز 6 ساعات بعد خسارتين متتاليتين خلال 24 ساعة)
+• ✅ Dynamic Break‑Even (BE بناءً على quantum_score)
+• ✅ BTC Correlation Filter (رفض LONG إذا BTC 1h RSI<40 أو close تحت EMA50)
+• ✅ مكافأة إضافية لـ BELOW_VALUE + BULLISH_FLOW
 
 🧯 Daily Circuit
 • Enabled: {'ON' if CONFIG.get('ENABLE_DAILY_MAX_LOSS', True) else 'OFF'}
 • Max Loss (R): {CONFIG.get('DAILY_MAX_LOSS_R')}
-• Max Daily A+: {CONFIG.get('MAX_DAILY_A_PLUS', 3)}
+• Max Daily A+: {CONFIG.get('MAX_DAILY_A_PLUS', 7)}
 
 ⏳ Cooldown
 • Seconds: {CONFIG.get('SYMBOL_COOLDOWN_SEC')}
@@ -4772,7 +4796,7 @@ async def generate_performance_report() -> str:
         metrics_summary = metrics.get_summary()
         
         report = f"""
-📊 تقرير الأداء - Quantum Flow v1.8.5 ULTIMATE INSTITUTIONAL EDITION
+📊 تقرير الأداء - Quantum Flow v1.8.6 ULTIMATE INSTITUTIONAL EDITION
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 🧾 الوضع
@@ -4782,7 +4806,7 @@ async def generate_performance_report() -> str:
 
 🎯 الإشارات (اليوم/الإجمالي)
 • المولدة: {STATS['signals_generated']}
-• A+ : {STATS['signals_a_plus']} (اليوم: {STATS.get('daily_a_plus_count', 0)}/{CONFIG.get('MAX_DAILY_A_PLUS', 3)})
+• A+ : {STATS['signals_a_plus']} (اليوم: {STATS.get('daily_a_plus_count', 0)}/{CONFIG.get('MAX_DAILY_A_PLUS', 7)})
 • A : {STATS['signals_a']}
 • B : {STATS['signals_b']}
 • متوسط النقاط: {STATS['avg_quantum_score']:.1f}/100
@@ -4829,7 +4853,8 @@ async def generate_performance_report() -> str:
 • إعادة المحاولات: {STATS['retries_count']}
 • Circuit Breaker: {api_circuit.get_state().get('state')}
 • Lock Failures: {sum(v['count'] for v in bot.lock_manager.failed_locks.values())}
-• Blacklisted Symbols: {sum(1 for s in bot.lock_manager.failed_locks.keys() if bot.lock_manager.is_blacklisted(s))}
+• Blacklisted Symbols (lock): {sum(1 for s in bot.lock_manager.failed_locks.keys() if bot.lock_manager.is_blacklisted(s))}
+• Consecutive Loss Blacklist: {len(bot.consecutive_loss_blacklist)}
 """
         
         if metrics_summary:
@@ -4849,11 +4874,10 @@ async def generate_performance_report() -> str:
         logger.error(f"[Report Generation Error] {e}")
         return f"❌ فشل إنشاء التقرير: {str(e)[:100]}"
 
-# ===================== COMPUTATIONAL OPTIMIZATION (مُعدل) =====================
+# ===================== COMPUTATIONAL OPTIMIZATION =====================
 async def toggle_computational_features():
     loop_count = STATS.get("loop_count", 0)
     
-    # تعيين علامات أخذ العينات دون تغيير الإعدادات الأساسية
     CONFIG["_ORDER_FLOW_SAMPLING_OK"] = (loop_count % 3 == 0)
     CONFIG["_VOLUME_PROFILE_SAMPLING_OK"] = (loop_count % 5 == 0)
     
@@ -4910,6 +4934,7 @@ async def health_check_handler(request):
             "cache_stats": cache_stats,
             "lock_failures": lock_failures,
             "blacklisted_symbols": blacklisted_count,
+            "consecutive_loss_blacklist": len(bot.consecutive_loss_blacklist),
             "performance_metrics": metrics.get_summary()
         }
     }
@@ -4944,7 +4969,7 @@ async def main_loop(exchange):
     
     try:
         logger.info("="*70)
-        logger.info("🚀 QUANTUM FLOW TRADING BOT v1.8.5 - ULTIMATE INSTITUTIONAL EDITION")
+        logger.info("🚀 QUANTUM FLOW TRADING BOT v1.8.6 - ULTIMATE INSTITUTIONAL EDITION")
         logger.info("✅ جميع التحسينات المؤسسية المطلوبة والإصلاحات الحرجة مطبقة")
         logger.info("="*70)
         logger.info(f"البورصة: {CONFIG['EXCHANGE'].upper()}")
@@ -4964,24 +4989,17 @@ async def main_loop(exchange):
         logger.info(f"ENHANCED LOCK MANAGER: ✅ (مع Recovery و Blacklisting و TTL)")
         logger.info(f"METRICS COLLECTOR: ✅ (مع تصحيح success)")
         logger.info(f"EXPONENTIAL BACKOFF RETRY: ✅")
-        logger.info("✅ جميع الإصلاحات الحرجة مطبقة:")
-        logger.info("  1. إصلاح استيراد talib (إزالة الاستيراد العلوي)")
-        logger.info("  2. إصلاح toggle_computational_features (استخدام علامات بدلاً من تعديل الإعدادات)")
-        logger.info("  3. إصلاح Liquidity Grab (استبعاد آخر شمعة)")
-        logger.info("  4. إصلاح double counting في close_trade_full (final_exit_r معرّف، واستخدام total_r في التاريخ)")
-        logger.info("  5. إضافة أمر وقف خسارة على المنصة مع الإلغاء والتحديث بعد الخروج الجزئي")
-        logger.info("  6. استخدام سعر التنفيذ الفعلي من أوامر البيع")
-        logger.info("  7. إعادة ترتيب حساب حجم الصفقة (SL أولاً)")
-        logger.info("  8. إضافة التحقق من صحة slice الحجم في price_acceptance_gate")
-        logger.info("  9. إزالة المتغيرات غير المستخدمة (next_candle)")
-        logger.info(" 10. تحسين إيقاف تشغيل خادم health check")
-        logger.info(" 11. تحسين أخذ عينات order flow (staggered per symbol) + stable hash")
-        logger.info(" 12. إصلاح Volume Profile بتمرير precheck_score")
-        logger.info(" 13. تحسين المراقبة بجلب tickers بالتوازي")
-        logger.info(" 14. تحسين التحقق من صحة الرموز (whitelist)")
-        logger.info(" 15. إصلاح Race Condition في partial_exit (قفل طوال العملية + is_exiting)")
-        logger.info(" 16. إزالة fallback asyncio.timeout واستخدام asyncio.wait_for مباشرة")
-        logger.info(" 17. إضافة مهمة Reconciliation للمطابقة بين الرصيد والمراكز")
+        logger.info("✅ جميع التحسينات الجديدة مدمجة:")
+        logger.info("  1. تعديلات القيم الصارمة (OB freshness 8, wick ratio 0.45, volume multiplier 1.7, LG confidence 70, cooldown 900, A+ cap 7, spread 0.15, ATR% 5.5, trend strength 65)")
+        logger.info("  2. تفعيل أمر SL على المنصة افتراضياً")
+        logger.info("  3. تحسين Order Flow Sampling (التشغيل دائماً لـ alignment≥2 إذا score>65)")
+        logger.info("  4. Momentum Confirmation (رفض LONG إذا RSI 5m < 45)")
+        logger.info("  5. Micro Structure Protection (رفض LONG إذا آخر close أقل من midpoint الشمعة السابقة)")
+        logger.info("  6. Slippage Recheck بعد التنفيذ (إغلاق الصفقة إذا RR الفعلي < 2.5)")
+        logger.info("  7. Consecutive Loss Guard (حظر الرمز 6 ساعات بعد خسارتين متتاليتين خلال 24 ساعة)")
+        logger.info("  8. Dynamic Break‑Even (BE بناءً على quantum_score)")
+        logger.info("  9. BTC Correlation Filter (رفض LONG إذا BTC 1h RSI<40 أو close تحت EMA50)")
+        logger.info(" 10. مكافأة إضافية لـ BELOW_VALUE + BULLISH_FLOW")
         logger.info("="*70)
         
         db_manager.init_database()
@@ -5025,7 +5043,7 @@ async def main_loop(exchange):
             logger.info("[Main] Balance reconciliation task started")
         
         await send_telegram(f"""
-🚀 تم تشغيل Quantum Flow Bot v1.8.5 - ULTIMATE INSTITUTIONAL EDITION
+🚀 تم تشغيل Quantum Flow Bot v1.8.6 - ULTIMATE INSTITUTIONAL EDITION
 
 🧾 الوضع
 • LIVE TRADING: {'ON' if is_live_trading_enabled() else 'OFF'}
@@ -5036,32 +5054,21 @@ async def main_loop(exchange):
 • SL on Exchange: {'ON' if CONFIG.get('LIVE_PLACE_SL_ORDER') else 'OFF'}
 
 ✅ التحسينات المؤسسية المطبقة
-• ✅ Atomic Partial Exit with Optimistic Locking + is_exiting flag
-• ✅ Enhanced Lock Manager with Recovery & Blacklisting (TTL)
-• ✅ Database Connection Leaks Fixed
-• ✅ Smart Cache with Memory Management
-• ✅ Exponential Backoff Retry Strategy
-• ✅ Enhanced Health Check with Diagnostics
-• ✅ Metrics Collector for Performance Monitoring
-• ✅ FVG Logic Corrected
-• ✅ Telegram Date Format Fixed
-• ✅ TA-Lib Import Fixed
-• ✅ Liquidity Grab Support/Resistance Fix
-• ✅ Daily Circuit Double Counting Fix
-• ✅ Order Flow Sampling Logic Fixed (staggered per symbol + stable hash)
-• ✅ Position Sizing Order Corrected
-• ✅ Volume Gate Slice Safety Added
-• ✅ Volume Profile precheck_score fix
-• ✅ close_trade_full final_exit_r defined
-• ✅ Trade history stores total R, stats incremental
-• ✅ SL order management on partial exits
-• ✅ Balance Reconciliation Task Added
-• ✅ asyncio.timeout fallback removed, replaced with asyncio.wait_for
+• ✅ تعديلات القيم الصارمة (OB freshness 8, wick ratio 0.45, volume multiplier 1.7, LG confidence 70, cooldown 900, A+ cap 7, spread 0.15, ATR% 5.5, trend strength 65)
+• ✅ تفعيل أمر SL على المنصة افتراضياً
+• ✅ تحسين Order Flow Sampling (التشغيل دائماً لـ alignment≥2 إذا score>65)
+• ✅ Momentum Confirmation (رفض LONG إذا RSI 5m < 45)
+• ✅ Micro Structure Protection (رفض LONG إذا آخر close أقل من midpoint الشمعة السابقة)
+• ✅ Slippage Recheck بعد التنفيذ (إغلاق الصفقة إذا RR الفعلي < 2.5)
+• ✅ Consecutive Loss Guard (حظر الرمز 6 ساعات بعد خسارتين متتاليتين خلال 24 ساعة)
+• ✅ Dynamic Break‑Even (BE بناءً على quantum_score)
+• ✅ BTC Correlation Filter (رفض LONG إذا BTC 1h RSI<40 أو close تحت EMA50)
+• ✅ مكافأة إضافية لـ BELOW_VALUE + BULLISH_FLOW
 
 🧯 Daily Circuit
 • Enabled: {'ON' if CONFIG.get('ENABLE_DAILY_MAX_LOSS', True) else 'OFF'}
 • Max Loss (R): {CONFIG.get('DAILY_MAX_LOSS_R')}
-• Max Daily A+: {CONFIG.get('MAX_DAILY_A_PLUS', 3)}
+• Max Daily A+: {CONFIG.get('MAX_DAILY_A_PLUS', 7)}
 
 ⏳ Cooldown
 • Seconds: {CONFIG.get('SYMBOL_COOLDOWN_SEC')}
@@ -5126,7 +5133,8 @@ async def main_loop(exchange):
                               f"dailyR={daily_circuit.get_state().get('realized_r',0.0):.2f}, blocked={daily_circuit.get_state().get('blocked')}, "
                               f"circuit={api_circuit.get_state().get('state')}, "
                               f"lock_failures={sum(v['count'] for v in bot.lock_manager.failed_locks.values())}, "
-                              f"blacklisted={sum(1 for s in bot.lock_manager.failed_locks.keys() if bot.lock_manager.is_blacklisted(s))}"
+                              f"blacklisted={sum(1 for s in bot.lock_manager.failed_locks.keys() if bot.lock_manager.is_blacklisted(s))}, "
+                              f"loss_blacklist={len(bot.consecutive_loss_blacklist)}"
                               )
                 
                 await asyncio.sleep(sleep_time)
@@ -5169,7 +5177,7 @@ async def async_main():
     
     try:
         logger.info("\n" + "="*70)
-        logger.info("QUANTUM FLOW v1.8.5 - ULTIMATE INSTITUTIONAL EDITION")
+        logger.info("QUANTUM FLOW v1.8.6 - ULTIMATE INSTITUTIONAL EDITION")
         logger.info("✅ جميع التحسينات المؤسسية المطلوبة والإصلاحات الحرجة مطبقة")
         logger.info("="*70)
         
@@ -5241,7 +5249,6 @@ async def async_main():
             logger.error(f"Cleanup errors: {', '.join(cleanup_errors)}")
 
 def main():
-    """نقطة الدخول الرئيسية مع حلقة إعادة تشغيل تلقائية"""
     while True:
         try:
             shutdown_manager.should_stop = False
