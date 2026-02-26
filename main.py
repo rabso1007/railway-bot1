@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 QUANTUM FLOW TRADING BOT v1.8.6 - ULTIMATE INSTITUTIONAL EDITION
+WITH EDGE INTELLIGENCE ENGINE
 تم دمج جميع التحسينات الاحترافية المطلوبة:
 - تعديل القيم الصارمة لتكون أكثر توازناً (OB freshness 8, wick ratio 0.45, volume multiplier 1.7, LG confidence 70, cooldown 900, A+ cap 7, spread 0.15, ATR% 5.5, trend strength 65)
 - تفعيل أمر SL على المنصة افتراضياً
@@ -12,6 +13,7 @@ QUANTUM FLOW TRADING BOT v1.8.6 - ULTIMATE INSTITUTIONAL EDITION
 - إضافة Dynamic Break‑Even (BE بناءً على quantum_score)
 - إضافة BTC Correlation Filter (رفض LONG إذا BTC 1h RSI<40 أو close تحت EMA50)
 - مكافأة إضافية لـ BELOW_VALUE + BULLISH_FLOW
+- EDGE INTELLIGENCE ENGINE (Self-monitoring, self-risk adjusting, self-protecting)
 جميع التغييرات مدمجة بدقة مع الحفاظ على الاستقرار والكفاءة.
 """
 
@@ -43,6 +45,9 @@ import copy
 from contextlib import contextmanager
 import random
 import math
+
+# ===================== EDGE ENGINE IMPORTS =====================
+from edge_engine import get_edge_engine, EdgeState
 
 # ------------------------------------------------------------
 # التحقق من المكتبات الاختيارية
@@ -1724,11 +1729,8 @@ def recalibrate_levels_on_fill(
         new_tp2 = fill_price + (orig_risk * tp2_rr)
         new_tp3 = fill_price + (orig_risk * tp3_rr)
         
-        new_position_value, _ = calculate_position_size(fill_price, new_sl)
-        if new_position_value < signal.position_size_usdt:
-            logger.info(f"[Recalibrate] Position size reduced from {signal.position_size_usdt:.2f} to {new_position_value:.2f}")
-            return new_sl, new_tp1, new_tp2, new_tp3, new_position_value
-        
+        # Position size recalculation happens in execute_live_entry_if_enabled
+        # using async calculate_position_size
         return new_sl, new_tp1, new_tp2, new_tp3, signal.position_size_usdt
     
     return signal.sl, signal.tp1, signal.tp2, signal.tp3, signal.position_size_usdt
@@ -3273,15 +3275,28 @@ def compute_sl_and_tp_from_structure(entry: float, market_structure: MarketStruc
     
     return sl, tp1, tp2, tp3
 
-# ===================== POSITION SIZING =====================
-def calculate_position_size(entry: float, sl: float, account_size: Optional[float] = None) -> Tuple[float, float]:
+# ===================== ASYNC POSITION SIZING WITH EDGE ENGINE =====================
+async def calculate_position_size(entry: float, sl: float, account_size: Optional[float] = None) -> Tuple[float, float]:
     if account_size is None:
         account_size = CONFIG["ACCOUNT_SIZE_USDT"]
     
     if not validate_price(entry) or not validate_price(sl) or sl >= entry:
         return 0.0, 0.0
     
-    risk_amount = account_size * (CONFIG["RISK_PER_TRADE_PCT"] / 100)
+    # Base risk amount from config
+    base_risk_amount = account_size * (CONFIG["RISK_PER_TRADE_PCT"] / 100)
+    
+    # === EDGE ENGINE: APPLY RISK MULTIPLIER ===
+    try:
+        edge_engine = await get_edge_engine()
+        risk_multiplier = edge_engine.risk_multiplier()
+        risk_amount = base_risk_amount * risk_multiplier
+        logger.debug("[EdgeEngine] Position sizing: base=%.2f, multiplier=%.2f, final=%.2f",
+                    base_risk_amount, risk_multiplier, risk_amount)
+    except Exception as e:
+        logger.error(f"[EdgeEngine] Error applying risk multiplier: {e}")
+        risk_amount = base_risk_amount
+    # ==========================================
     
     risk_per_unit = entry - sl
     if risk_per_unit <= 0:
@@ -3387,151 +3402,6 @@ def should_run_order_flow(symbol: str, mtf_alignment: int, precheck_score: float
             return True
     
     return False
-
-# ===================== EMERGENCY STATE MONITOR =====================
-async def emergency_state_monitor(exchange):
-    MAX_TOTAL_ATTEMPTS = 10
-    
-    while not shutdown_manager.should_stop:
-        try:
-            await asyncio.sleep(300)
-            
-            emergency_trades = []
-            acquired_symbols = await bot.lock_manager.acquire_all_locks()
-            if not acquired_symbols:
-                continue
-            
-            try:
-                for symbol, trade in list(ACTIVE_TRADES.items()):
-                    if trade.emergency_state:
-                        emergency_trades.append((symbol, copy.deepcopy(trade)))
-            finally:
-                bot.lock_manager.release_all_locks(acquired_symbols)
-            
-            if not emergency_trades:
-                continue
-            
-            for symbol, trade_snapshot in emergency_trades:
-                try:
-                    if trade_snapshot.emergency_attempts >= MAX_TOTAL_ATTEMPTS:
-                        await send_telegram(
-                            f"🛑 EMERGENCY ABANDONED: {symbol}\n"
-                            f"Max attempts ({MAX_TOTAL_ATTEMPTS}) exceeded",
-                            critical=True
-                        )
-                        if await bot.get_trade_lock(symbol):
-                            try:
-                                if symbol in ACTIVE_TRADES:
-                                    ACTIVE_TRADES[symbol].emergency_state = False
-                                    db_manager.save_trade(ACTIVE_TRADES[symbol])
-                            finally:
-                                bot.release_trade_lock(symbol)
-                        continue
-                    
-                    last_attempt = datetime.fromisoformat(
-                        trade_snapshot.emergency_last_attempt.replace('Z', '+00:00')
-                    )
-                    if (datetime.now(timezone.utc) - last_attempt).total_seconds() < 600:
-                        continue
-                    
-                    await rate_limiter.wait_if_needed(weight=2)
-                    ticker = await exchange.fetch_ticker(symbol)
-                    current_price = safe_float(ticker.get('last'))
-                    
-                    if not validate_price(current_price):
-                        continue
-                    
-                    remaining_base = trade_snapshot.entry_fill_amount * trade_snapshot.remaining_position
-                    
-                    sell_order = await market_sell_safe(exchange, symbol, remaining_base, max_retries=2)
-                    
-                    if sell_order:
-                        fill_price = safe_float(sell_order.get('average')) or safe_float(sell_order.get('price')) or current_price
-                        risk = trade_snapshot.entry - trade_snapshot.original_sl
-                        r_multiple = (fill_price - trade_snapshot.entry) / risk if risk > 0 else 0
-                        
-                        await close_trade_full(symbol, fill_price, "EMERGENCY_RECOVERY", exchange=exchange, sell_order_info=sell_order)
-                        
-                        await send_telegram(
-                            f"🟢 EMERGENCY RECOVERY SUCCESS\n\n"
-                            f"الرمز: {escape_html(symbol)}\n"
-                            f"تم البيع الناجح بعد {trade_snapshot.emergency_attempts} محاولات فاشلة.\n"
-                            f"تم إغلاق الصفقة تلقائيًا."
-                        )
-                    else:
-                        if await bot.get_trade_lock(symbol):
-                            try:
-                                if symbol in ACTIVE_TRADES:
-                                    ACTIVE_TRADES[symbol].emergency_attempts += 1
-                                    ACTIVE_TRADES[symbol].emergency_last_attempt = now_utc_iso()
-                                    db_manager.save_trade(ACTIVE_TRADES[symbol])
-                            finally:
-                                bot.release_trade_lock(symbol)
-                        
-                        if trade_snapshot.emergency_attempts % 3 == 0:
-                            await send_telegram(
-                                f"🔄 EMERGENCY REMINDER (Attempt {trade_snapshot.emergency_attempts})\n\n"
-                                f"الرمز: {escape_html(symbol)}\n"
-                                f"السبب: {escape_html(trade_snapshot.emergency_reason[:100])}\n"
-                                f"الكمية المتبقية (BASE): {remaining_base}\n\n"
-                                f"⚠️ الصفقة لا تزال في حالة الطوارئ. يرجى البيع يدويًا أو الانتظار لمحاولة تلقائية أخرى."
-                            )
-                    
-                except Exception as e:
-                    logger.error(f"[Emergency Monitor Error] {symbol}: {str(e)[:100]}")
-                    continue
-        
-        except Exception as e:
-            logger.error(f"[Emergency Monitor Main Error] {str(e)}")
-            await asyncio.sleep(60)
-
-# ===================== BALANCE RECONCILIATION TASK =====================
-async def reconcile_balances(exchange):
-    while not shutdown_manager.should_stop:
-        await asyncio.sleep(CONFIG.get("RECONCILIATION_INTERVAL_SEC", 300))
-        
-        if not is_live_trading_enabled():
-            continue
-        
-        if not ACTIVE_TRADES:
-            continue
-        
-        try:
-            balance = await exchange.fetch_balance()
-            if not balance:
-                continue
-            
-            for symbol, trade in list(ACTIVE_TRADES.items()):
-                try:
-                    base_asset = symbol.split('/')[0]
-                    real_balance = balance['free'].get(base_asset, 0.0)
-                    
-                    expected = trade.entry_fill_amount * trade.remaining_position
-                    
-                    if abs(real_balance - expected) > CONFIG["MIN_DUST_THRESHOLD"]:
-                        logger.warning(f"[Reconciliation] Mismatch for {symbol}: expected {expected:.8f}, real {real_balance:.8f}")
-                        await send_telegram(
-                            f"⚠️ تنبيه المطابقة\n\n"
-                            f"الرمز: {escape_html(symbol)}\n"
-                            f"الرصيد المتوقع: {expected:.8f} {base_asset}\n"
-                            f"الرصيد الفعلي: {real_balance:.8f} {base_asset}\n"
-                            f"الفرق: {abs(real_balance - expected):.8f}\n\n"
-                            f"قد يكون هناك تنفيذ غير متوقع أو خطأ في الحسابات الداخلية.",
-                            critical=False
-                        )
-                        
-                        if abs(real_balance - expected) > expected * 0.1:
-                            await mark_trade_emergency(
-                                symbol,
-                                reason=f"Reconciliation mismatch: expected {expected}, real {real_balance}",
-                                critical_msg=f"🚨 Reconciliation Critical: {symbol}\nفرق كبير بين الرصيد الفعلي والمتوقع. يرجى المراجعة الفورية."
-                            )
-                except Exception as e:
-                    logger.error(f"[Reconciliation] Error processing {symbol}: {e}")
-                    continue
-        
-        except Exception as e:
-            logger.error(f"[Reconciliation] Main error: {e}")
 
 # ===================== BTC FILTER SPECIFIC =====================
 async def check_btc_filter(exchange) -> bool:
@@ -3641,7 +3511,7 @@ async def generate_quantum_signal(exchange, symbol: str) -> Optional[QuantumSign
         if sl == 0:
             return None
         
-        position_size_usdt, position_size_pct = calculate_position_size(entry, sl)
+        position_size_usdt, position_size_pct = await calculate_position_size(entry, sl)
         if position_size_usdt == 0:
             return None
         
@@ -4648,6 +4518,19 @@ async def close_trade_full(symbol: str, exit_price: float, exit_type: str, excha
     else:
         total_r = total_realized_r
     
+    # === EDGE ENGINE: RECORD TRADE RESULT ===
+    try:
+        edge_engine = await get_edge_engine()
+        await edge_engine.record_trade(
+            r_multiple=total_r,
+            quantum_score=quantum_score,
+            exit_type=exit_type
+        )
+        logger.debug("[EdgeEngine] Recorded trade for %s: R=%.2f", symbol, total_r)
+    except Exception as e:
+        logger.error("[EdgeEngine] Failed to record trade: %s", str(e))
+    # ========================================
+    
     profit_pct = ((fill_price - entry) / entry) * 100
     
     if exit_type == "SL":
@@ -4737,6 +4620,7 @@ async def generate_performance_report() -> str:
 • ✅ Dynamic Break‑Even (BE بناءً على quantum_score)
 • ✅ BTC Correlation Filter (رفض LONG إذا BTC 1h RSI<40 أو close تحت EMA50)
 • ✅ مكافأة إضافية لـ BELOW_VALUE + BULLISH_FLOW
+• ✅ Edge Intelligence Engine (Self-monitoring, Self-risk adjusting, Self-protecting)
 
 🧯 Daily Circuit
 • Enabled: {'ON' if CONFIG.get('ENABLE_DAILY_MAX_LOSS', True) else 'OFF'}
@@ -5000,6 +4884,7 @@ async def main_loop(exchange):
         logger.info("  8. Dynamic Break‑Even (BE بناءً على quantum_score)")
         logger.info("  9. BTC Correlation Filter (رفض LONG إذا BTC 1h RSI<40 أو close تحت EMA50)")
         logger.info(" 10. مكافأة إضافية لـ BELOW_VALUE + BULLISH_FLOW")
+        logger.info(" 11. Edge Intelligence Engine (Self-monitoring, Self-risk adjusting, Self-protecting)")
         logger.info("="*70)
         
         db_manager.init_database()
@@ -5064,6 +4949,7 @@ async def main_loop(exchange):
 • ✅ Dynamic Break‑Even (BE بناءً على quantum_score)
 • ✅ BTC Correlation Filter (رفض LONG إذا BTC 1h RSI<40 أو close تحت EMA50)
 • ✅ مكافأة إضافية لـ BELOW_VALUE + BULLISH_FLOW
+• ✅ Edge Intelligence Engine (Self-monitoring, Self-risk adjusting, Self-protecting)
 
 🧯 Daily Circuit
 • Enabled: {'ON' if CONFIG.get('ENABLE_DAILY_MAX_LOSS', True) else 'OFF'}
@@ -5098,6 +4984,17 @@ async def main_loop(exchange):
                 
                 await toggle_computational_features()
                 
+                # === EDGE ENGINE: EARLY TRADE BLOCKER ===
+                try:
+                    edge_engine = await get_edge_engine()
+                    if not edge_engine.should_trade():
+                        logger.info("[EdgeEngine] System state PAUSED - sleeping for 60 seconds")
+                        await asyncio.sleep(60)
+                        continue
+                except Exception as e:
+                    logger.error(f"[EdgeEngine] Error checking trade state: {e}")
+                # ========================================
+                
                 btc_status = await check_btc_trend(exchange)
                 if not btc_status['safe_to_trade']:
                     logger.warning(f"[Main] التداول متوقف مؤقتاً - BTC {btc_status['trend']}")
@@ -5119,11 +5016,30 @@ async def main_loop(exchange):
                 if loop_count % 50 == 0:
                     report = await generate_performance_report()
                     await send_telegram(report)
+                    
+                    # === EDGE ENGINE: TELEMETRY REPORT ===
+                    try:
+                        edge_engine = await get_edge_engine()
+                        edge_report = edge_engine.get_telemetry_report()
+                        await send_telegram(f"<code>{edge_report}</code>")
+                        
+                        # Check for low correlation warning
+                        if edge_engine.score_r_corr < 0.1 and len(edge_engine.trades) >= 20:
+                            await send_telegram(
+                                f"⚠️ <b>Quantum score losing predictive power</b>\n"
+                                f"Correlation: {edge_engine.score_r_corr:.2f}\n"
+                                f"Trades analyzed: {len(edge_engine.trades)}",
+                                critical=False
+                            )
+                    except Exception as e:
+                        logger.error(f"[EdgeEngine] Telemetry error: {str(e)}")
+                    # =====================================
                 
                 loop_time = time.time() - loop_start
                 sleep_time = max(5, 15 - loop_time)
                 
                 if CONFIG["DEBUG_MODE"] or loop_count % 10 == 0:
+                    edge_state = await get_edge_engine()
                     logger.info(f"[دورة {loop_count}] الوقت: {loop_time:.1f}ث، الانتظار: {sleep_time:.1f}ث، "
                               f"الإشارات: {STATS['signals_generated']}, النشطة: {len(ACTIVE_TRADES)}, "
                               f"paper_opened={STATS.get('paper_trades_opened',0)}, cooldown={CONFIG.get('SYMBOL_COOLDOWN_SEC')}, "
@@ -5134,7 +5050,8 @@ async def main_loop(exchange):
                               f"circuit={api_circuit.get_state().get('state')}, "
                               f"lock_failures={sum(v['count'] for v in bot.lock_manager.failed_locks.values())}, "
                               f"blacklisted={sum(1 for s in bot.lock_manager.failed_locks.keys() if bot.lock_manager.is_blacklisted(s))}, "
-                              f"loss_blacklist={len(bot.consecutive_loss_blacklist)}"
+                              f"loss_blacklist={len(bot.consecutive_loss_blacklist)}, "
+                              f"edge_state={edge_state.system_state}, edge_mult={edge_state.risk_multiplier():.2f}"
                               )
                 
                 await asyncio.sleep(sleep_time)
@@ -5170,6 +5087,151 @@ async def main_loop(exchange):
                 logger.info("✅ Health check server cleaned up")
             except Exception as e:
                 logger.error(f"Error cleaning up health check: {e}")
+
+# ===================== EMERGENCY STATE MONITOR =====================
+async def emergency_state_monitor(exchange):
+    MAX_TOTAL_ATTEMPTS = 10
+    
+    while not shutdown_manager.should_stop:
+        try:
+            await asyncio.sleep(300)
+            
+            emergency_trades = []
+            acquired_symbols = await bot.lock_manager.acquire_all_locks()
+            if not acquired_symbols:
+                continue
+            
+            try:
+                for symbol, trade in list(ACTIVE_TRADES.items()):
+                    if trade.emergency_state:
+                        emergency_trades.append((symbol, copy.deepcopy(trade)))
+            finally:
+                bot.lock_manager.release_all_locks(acquired_symbols)
+            
+            if not emergency_trades:
+                continue
+            
+            for symbol, trade_snapshot in emergency_trades:
+                try:
+                    if trade_snapshot.emergency_attempts >= MAX_TOTAL_ATTEMPTS:
+                        await send_telegram(
+                            f"🛑 EMERGENCY ABANDONED: {symbol}\n"
+                            f"Max attempts ({MAX_TOTAL_ATTEMPTS}) exceeded",
+                            critical=True
+                        )
+                        if await bot.get_trade_lock(symbol):
+                            try:
+                                if symbol in ACTIVE_TRADES:
+                                    ACTIVE_TRADES[symbol].emergency_state = False
+                                    db_manager.save_trade(ACTIVE_TRADES[symbol])
+                            finally:
+                                bot.release_trade_lock(symbol)
+                        continue
+                    
+                    last_attempt = datetime.fromisoformat(
+                        trade_snapshot.emergency_last_attempt.replace('Z', '+00:00')
+                    )
+                    if (datetime.now(timezone.utc) - last_attempt).total_seconds() < 600:
+                        continue
+                    
+                    await rate_limiter.wait_if_needed(weight=2)
+                    ticker = await exchange.fetch_ticker(symbol)
+                    current_price = safe_float(ticker.get('last'))
+                    
+                    if not validate_price(current_price):
+                        continue
+                    
+                    remaining_base = trade_snapshot.entry_fill_amount * trade_snapshot.remaining_position
+                    
+                    sell_order = await market_sell_safe(exchange, symbol, remaining_base, max_retries=2)
+                    
+                    if sell_order:
+                        fill_price = safe_float(sell_order.get('average')) or safe_float(sell_order.get('price')) or current_price
+                        risk = trade_snapshot.entry - trade_snapshot.original_sl
+                        r_multiple = (fill_price - trade_snapshot.entry) / risk if risk > 0 else 0
+                        
+                        await close_trade_full(symbol, fill_price, "EMERGENCY_RECOVERY", exchange=exchange, sell_order_info=sell_order)
+                        
+                        await send_telegram(
+                            f"🟢 EMERGENCY RECOVERY SUCCESS\n\n"
+                            f"الرمز: {escape_html(symbol)}\n"
+                            f"تم البيع الناجح بعد {trade_snapshot.emergency_attempts} محاولات فاشلة.\n"
+                            f"تم إغلاق الصفقة تلقائيًا."
+                        )
+                    else:
+                        if await bot.get_trade_lock(symbol):
+                            try:
+                                if symbol in ACTIVE_TRADES:
+                                    ACTIVE_TRADES[symbol].emergency_attempts += 1
+                                    ACTIVE_TRADES[symbol].emergency_last_attempt = now_utc_iso()
+                                    db_manager.save_trade(ACTIVE_TRADES[symbol])
+                            finally:
+                                bot.release_trade_lock(symbol)
+                        
+                        if trade_snapshot.emergency_attempts % 3 == 0:
+                            await send_telegram(
+                                f"🔄 EMERGENCY REMINDER (Attempt {trade_snapshot.emergency_attempts})\n\n"
+                                f"الرمز: {escape_html(symbol)}\n"
+                                f"السبب: {escape_html(trade_snapshot.emergency_reason[:100])}\n"
+                                f"الكمية المتبقية (BASE): {remaining_base}\n\n"
+                                f"⚠️ الصفقة لا تزال في حالة الطوارئ. يرجى البيع يدويًا أو الانتظار لمحاولة تلقائية أخرى."
+                            )
+                    
+                except Exception as e:
+                    logger.error(f"[Emergency Monitor Error] {symbol}: {str(e)[:100]}")
+                    continue
+        
+        except Exception as e:
+            logger.error(f"[Emergency Monitor Main Error] {str(e)}")
+            await asyncio.sleep(60)
+
+# ===================== BALANCE RECONCILIATION TASK =====================
+async def reconcile_balances(exchange):
+    while not shutdown_manager.should_stop:
+        await asyncio.sleep(CONFIG.get("RECONCILIATION_INTERVAL_SEC", 300))
+        
+        if not is_live_trading_enabled():
+            continue
+        
+        if not ACTIVE_TRADES:
+            continue
+        
+        try:
+            balance = await exchange.fetch_balance()
+            if not balance:
+                continue
+            
+            for symbol, trade in list(ACTIVE_TRADES.items()):
+                try:
+                    base_asset = symbol.split('/')[0]
+                    real_balance = balance['free'].get(base_asset, 0.0)
+                    
+                    expected = trade.entry_fill_amount * trade.remaining_position
+                    
+                    if abs(real_balance - expected) > CONFIG["MIN_DUST_THRESHOLD"]:
+                        logger.warning(f"[Reconciliation] Mismatch for {symbol}: expected {expected:.8f}, real {real_balance:.8f}")
+                        await send_telegram(
+                            f"⚠️ تنبيه المطابقة\n\n"
+                            f"الرمز: {escape_html(symbol)}\n"
+                            f"الرصيد المتوقع: {expected:.8f} {base_asset}\n"
+                            f"الرصيد الفعلي: {real_balance:.8f} {base_asset}\n"
+                            f"الفرق: {abs(real_balance - expected):.8f}\n\n"
+                            f"قد يكون هناك تنفيذ غير متوقع أو خطأ في الحسابات الداخلية.",
+                            critical=False
+                        )
+                        
+                        if abs(real_balance - expected) > expected * 0.1:
+                            await mark_trade_emergency(
+                                symbol,
+                                reason=f"Reconciliation mismatch: expected {expected}, real {real_balance}",
+                                critical_msg=f"🚨 Reconciliation Critical: {symbol}\nفرق كبير بين الرصيد الفعلي والمتوقع. يرجى المراجعة الفورية."
+                            )
+                except Exception as e:
+                    logger.error(f"[Reconciliation] Error processing {symbol}: {e}")
+                    continue
+        
+        except Exception as e:
+            logger.error(f"[Reconciliation] Main error: {e}")
 
 # ===================== ENTRY POINT =====================
 async def async_main():
@@ -5220,6 +5282,11 @@ async def async_main():
         if is_live_trading_enabled():
             exchange.apiKey = CONFIG.get("MEXC_API_KEY", "")
             exchange.secret = CONFIG.get("MEXC_API_SECRET", "")
+        
+        # === EDGE ENGINE INITIALIZATION ===
+        edge_engine = await get_edge_engine()
+        logger.info("[EdgeEngine] Initialized with state: %s", edge_engine.system_state)
+        # ================================
         
         await main_loop(exchange)
         
