@@ -3,18 +3,21 @@
 QUANTUM FLOW TRADING BOT v1.8.6 - ULTIMATE INSTITUTIONAL EDITION
 WITH EDGE INTELLIGENCE ENGINE
 تم دمج جميع التحسينات الاحترافية المطلوبة:
-- تعديل القيم الصارمة لتكون أكثر توازناً (OB freshness 8, wick ratio 0.45, volume multiplier 1.7, LG confidence 70, cooldown 900, A+ cap 7, spread 0.15, ATR% 5.5, trend strength 65)
-- تفعيل أمر SL على المنصة افتراضياً
-- تحسين Order Flow Sampling (التشغيل دائماً لـ alignment≥2 إذا score>65)
-- إضافة Momentum Confirmation (رفض LONG إذا RSI 5m < 45)
-- إضافة Micro Structure Protection (رفض LONG إذا آخر close أقل من midpoint الشمعة السابقة)
-- إضافة Slippage Recheck بعد التنفيذ (إغلاق الصفقة إذا RR الفعلي < 2.5)
-- إضافة Consecutive Loss Guard (حظر الرمز 6 ساعات بعد خسارتين متتاليتين خلال 24 ساعة)
-- إضافة Dynamic Break‑Even (BE بناءً على quantum_score)
-- إضافة BTC Correlation Filter (رفض LONG إذا BTC 1h RSI<40 أو close تحت EMA50)
-- مكافأة إضافية لـ BELOW_VALUE + BULLISH_FLOW
-- EDGE INTELLIGENCE ENGINE (Self-monitoring, self-risk adjusting, self-protecting)
-جميع التغييرات مدمجة بدقة مع الحفاظ على الاستقرار والكفاءة.
+- تعديل القيم الصارمة (trend strength 70, min score 68, spread 0.10, cooldown 1200)
+- تحسين Order Flow + Liquidity Grab (السماح بـ NEUTRAL عند وجود LG)
+- RSI window (45-68)
+- Micro Structure Protection (مع شرط الحجم)
+- Quantum Score Rebalance (الأوزان الجديدة)
+- Dynamic Position Sizing (حسب النقاط)
+- Dynamic Break‑Even (حسب النقاط)
+- Trailing Stop مع حماية مناطق السيولة والأوردر بلوك
+- Symbol Filter (أعلى 50 سيولة، حجم > 2M, سعر >= 0.00001)
+- BTC Correlation Filter (corr < 0.2 مرفوض)
+- Market Volatility Filter (ATR% 15m > 6% مرفوض)
+- Spread Filter (0.10%)
+- Cooldown 1200 ثانية
+- Max Symbol Scan 50
+جميع التغييرات مدمجة بدقة مع الحفاظ على الأنظمة الأساسية.
 """
 
 import asyncio
@@ -334,6 +337,7 @@ class TradingBot:
         self.btc_last_check: float = 0
         self.consecutive_losses: Dict[str, List[float]] = defaultdict(list)  # timestamps of losses
         self.consecutive_loss_blacklist: Dict[str, float] = {}  # symbol -> expiry timestamp
+        self.correlation_cache: Dict[str, Tuple[float, float]] = {}  # symbol -> (correlation, timestamp)
     
     async def get_trade_lock(self, symbol: str):
         return await self.lock_manager.acquire_trade_lock(symbol)
@@ -684,6 +688,10 @@ class TradeState:
     entry_assumed: bool = False
     is_exiting: bool = False
     _version: int = 0
+    # [IMPROVEMENT] Fields for trailing stop protection
+    order_block_low: float = 0.0
+    order_block_high: float = 0.0
+    liquidity_grab_level: float = 0.0
 
     def update_timestamp(self):
         self.last_update = now_utc_iso()
@@ -781,24 +789,24 @@ CONFIG = {
     
     # Trading Settings
     "LONG_ONLY": True,
-    "MIN_QUANTUM_SCORE": 65,
+    "MIN_QUANTUM_SCORE": 68,                     # [IMPROVEMENT] increased from 65
     "QUANTUM_A_SCORE": 75,
     "QUANTUM_A_PLUS_SCORE": 80,
-    "MAX_DAILY_A_PLUS": 7,                # ✅ تم الرفع من 5 إلى 7
+    "MAX_DAILY_A_PLUS": 7,
     
     # Hard Gates
     "ENABLE_HARD_GATES": True,
-    "HARD_GATE_1_MIN_TREND_STRENGTH": 65,  # ✅ تم الرفع من 60 إلى 65
+    "HARD_GATE_1_MIN_TREND_STRENGTH": 70,        # [IMPROVEMENT] increased from 65
     "HARD_GATE_1_MIN_MTF_ALIGNMENT": 2,
     "HARD_GATE_2_REQUIRE_ZONE": True,
-    "HARD_GATE_2_MIN_LG_CONFIDENCE": 70,   # ✅ تم التعديل من 75 إلى 70
-    "HARD_GATE_2_OB_FRESHNESS": 8,         # ✅ تم التعديل من 5 إلى 8
+    "HARD_GATE_2_MIN_LG_CONFIDENCE": 70,
+    "HARD_GATE_2_OB_FRESHNESS": 8,
     "HARD_GATE_3_REQUIRE_BOOSTER": False,
     
     # Liquidity Grab Settings
-    "LG_WICK_MIN_RATIO": 0.45,              # ✅ تم التعديل من 0.6 إلى 0.45
+    "LG_WICK_MIN_RATIO": 0.45,
     "LG_RECOVERY_MIN": 0.5,
-    "LG_VOLUME_MULTIPLIER": 1.7,             # ✅ تم التعديل من 2.0 إلى 1.7
+    "LG_VOLUME_MULTIPLIER": 1.7,
     "LG_EQUAL_LOWS_REQUIRED": 3,
     "LG_EQUAL_LOWS_RANGE_ATR_MULT": 0.5,
     
@@ -831,7 +839,7 @@ CONFIG = {
     "MEXC_API_KEY": "",
     "MEXC_API_SECRET": "",
     "LIVE_MAX_OPEN_TRADES": 5,
-    "MAX_SPREAD_PCT": 0.15,                  # ✅ تم التعديل من 0.1 إلى 0.15
+    "MAX_SPREAD_PCT": 0.10,                      # [IMPROVEMENT] reduced from 0.15
     "ENTRY_ORDER_TYPE": "limit",
     "ENTRY_LIMIT_TIMEOUT_SEC": 120,
     "ENTRY_LIMIT_POLL_SEC": 3,
@@ -840,7 +848,7 @@ CONFIG = {
     "LIVE_RECALIBRATION_MODE": "rr",
     "LIVE_REQUIRE_BALANCE_RECONCILIATION": True,
     "MIN_DUST_THRESHOLD": 0.000001,
-    "LIVE_PLACE_SL_ORDER": True,              # ✅ مفعل الآن
+    "LIVE_PLACE_SL_ORDER": True,
     "LIVE_SL_ORDER_TYPE": "stop-loss",
     
     # Paper Trading
@@ -849,12 +857,12 @@ CONFIG = {
     
     # Entry Quality Filter
     "ENABLE_ENTRY_QUALITY_FILTER": True,
-    "ENTRY_QUALITY_MAX_ATR_PCT_5M": 5.5,      # ✅ تم التعديل من 6.5 إلى 5.5
+    "ENTRY_QUALITY_MAX_ATR_PCT_5M": 5.5,
     "ENTRY_QUALITY_MAX_BB_WIDTH_5M": 0.08,
     "ENTRY_QUALITY_MAX_DISTANCE_FROM_ZONE_ATR": 1.2,
     
     # Cooldown
-    "SYMBOL_COOLDOWN_SEC": 900,                # ✅ تم التعديل من 1800 إلى 900
+    "SYMBOL_COOLDOWN_SEC": 1200,                  # [IMPROVEMENT] increased from 900
     
     # Daily Circuit Breaker
     "ENABLE_DAILY_MAX_LOSS": True,
@@ -895,7 +903,7 @@ CONFIG = {
     
     # Advanced
     "ORDER_FLOW_ENABLE_FOR_ALIGNMENT_2_IF_STRONG_SCORE": True,
-    "ORDER_FLOW_PRECHECK_MIN_SCORE": 65.0,     # ✅ تم التعديل من 75 إلى 65
+    "ORDER_FLOW_PRECHECK_MIN_SCORE": 68.0,       # [IMPROVEMENT] aligned with MIN_QUANTUM_SCORE
     
     # INSTITUTIONAL FEATURES
     "ENABLE_MEMORY_MONITORING": False,
@@ -914,6 +922,9 @@ CONFIG = {
     
     # Reconciliation
     "RECONCILIATION_INTERVAL_SEC": 300,
+    
+    # [IMPROVEMENT] New volatility filter
+    "MAX_ATR_PCT_15M": 6.0,
 }
 
 # ===================== TELEGRAM ENV AUTO-LOAD =====================
@@ -1829,6 +1840,20 @@ class DatabaseManager:
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_exit_time ON trade_history(exit_time DESC)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_version ON active_trades(version)")
             
+            # [IMPROVEMENT] Add new columns if not exist
+            try:
+                cursor.execute("ALTER TABLE active_trades ADD COLUMN order_block_low REAL DEFAULT 0")
+            except sqlite3.OperationalError:
+                pass
+            try:
+                cursor.execute("ALTER TABLE active_trades ADD COLUMN order_block_high REAL DEFAULT 0")
+            except sqlite3.OperationalError:
+                pass
+            try:
+                cursor.execute("ALTER TABLE active_trades ADD COLUMN liquidity_grab_level REAL DEFAULT 0")
+            except sqlite3.OperationalError:
+                pass
+            
             conn.commit()
     
     def save_daily_state(self, date: str, realized_r: float, blocked: bool):
@@ -1882,8 +1907,8 @@ class DatabaseManager:
                      tp1_hit, tp2_hit, tp3_hit, remaining_position, be_moved,
                      trailing_active, entry_time, last_update, total_realized_r, signal_data,
                      emergency_state, emergency_reason, emergency_last_attempt, emergency_attempts, version,
-                     sl_order_id)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     sl_order_id, order_block_low, order_block_high, liquidity_grab_level)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     trade_state.symbol,
                     trade_state.entry,
@@ -1908,7 +1933,10 @@ class DatabaseManager:
                     trade_state.emergency_last_attempt,
                     trade_state.emergency_attempts,
                     trade_state._version,
-                    trade_state.sl_order_id
+                    trade_state.sl_order_id,
+                    trade_state.order_block_low,
+                    trade_state.order_block_high,
+                    trade_state.liquidity_grab_level
                 ))
         except Exception as e:
             logger.error(f"[DB Save Error] {str(e)}")
@@ -2028,7 +2056,11 @@ class DatabaseManager:
                         execution_mode=(sd.get("execution_mode") if isinstance(sd, dict) else "") or ("PAPER" if not is_live_trading_enabled() else "LIVE"),
                         entry_assumed=bool(sd.get("entry_assumed")) if isinstance(sd, dict) else False,
                         _version=version,
-                        sl_order_id=row['sl_order_id'] if 'sl_order_id' in row.keys() else ""
+                        sl_order_id=row['sl_order_id'] if 'sl_order_id' in row.keys() else "",
+                        # [IMPROVEMENT] Load new fields with defaults if missing
+                        order_block_low=row['order_block_low'] if 'order_block_low' in row.keys() else 0.0,
+                        order_block_high=row['order_block_high'] if 'order_block_high' in row.keys() else 0.0,
+                        liquidity_grab_level=row['liquidity_grab_level'] if 'liquidity_grab_level' in row.keys() else 0.0,
                     )
                     trades[row['symbol']] = trade_state
                 
@@ -2262,6 +2294,13 @@ def load_checkpoint() -> bool:
         at = checkpoint.get('active_trades', {}) or {}
         for symbol, trade_data in at.items():
             try:
+                # Ensure new fields are present with defaults
+                if 'order_block_low' not in trade_data:
+                    trade_data['order_block_low'] = 0.0
+                if 'order_block_high' not in trade_data:
+                    trade_data['order_block_high'] = 0.0
+                if 'liquidity_grab_level' not in trade_data:
+                    trade_data['liquidity_grab_level'] = 0.0
                 ACTIVE_TRADES[symbol] = TradeState(**trade_data)
                 recovered += 1
             except Exception:
@@ -3122,7 +3161,7 @@ def evaluate_hard_gates(
     
     return all_gates_passed, gates_passed
 
-# ===================== ENHANCED QUANTUM SCORING =====================
+# ===================== ENHANCED QUANTUM SCORING (NEW WEIGHTS) =====================
 def calculate_quantum_score(
     market_structure: MarketStructure,
     order_flow: Optional[OrderFlowData],
@@ -3143,50 +3182,58 @@ def calculate_quantum_score(
     score = 0.0
     confidence_factors = []
     
-    # 1. Structure + BOS (max 25)
-    if market_structure.structure == "BULLISH":
-        score += 15
-        confidence_factors.append(60)
-    if market_structure.bos_bullish:
-        score += 10
-        confidence_factors.append(80)
+    # [IMPROVEMENT] New weights distribution
     
-    # 2. Liquidity Grab (max 20)
+    # 1. Liquidity Grab (max 25)
     if liquidity_grab and liquidity_grab.detected and liquidity_grab.grab_type == "BULLISH":
-        lg_score = min(liquidity_grab.confidence / 5, 20)
-        score += lg_score
-        confidence_factors.append(liquidity_grab.confidence)
+        lg_score = 15 + min(liquidity_grab.confidence * 0.1, 10)  # 15 base + up to 10 from confidence
         if hasattr(liquidity_grab, 'equal_lows') and liquidity_grab.equal_lows:
-            score += 3
+            lg_score = min(lg_score + 3, 25)
+        score += min(lg_score, 25)
+        confidence_factors.append(liquidity_grab.confidence)
     
-    # 3. Order Flow (max 20)
+    # 2. Order Block (max 20)
+    if market_structure.order_block:
+        ob_score = 10  # base
+        freshness = market_structure.order_block.get('freshness', 100)
+        if freshness < 5:
+            ob_score += 10
+        elif freshness < 10:
+            ob_score += 5
+        ob_score = min(ob_score, 20)
+        score += ob_score
+        confidence_factors.append(80)  # placeholder confidence
+    
+    # 3. Break of Structure (max 15)
+    if market_structure.bos_bullish:
+        bos_score = 15
+        score += bos_score
+        confidence_factors.append(90)
+    
+    # 4. Order Flow (max 15)
     if order_flow:
         of_score = 0
         if order_flow.signal == "BULLISH":
-            of_score += 10
-            confidence_factors.append(order_flow.confidence)
+            of_score += 5
         if order_flow.volume_profile == "AGGRESSIVE_BUYING":
             of_score += 10
-            confidence_factors.append(75)
         elif order_flow.volume_profile == "ABSORPTION":
-            of_score += 15
-            confidence_factors.append(85)
+            of_score += 10
         elif order_flow.volume_profile == "DISTRIBUTION":
-            of_score -= 10
-            confidence_factors.append(30)
+            of_score -= 5  # negative but min 0
         if order_flow.imbalance > 0.3:
-            of_score += 5
-        score += max(0, of_score)
+            of_score += 2
+        of_score = max(0, min(15, of_score))
+        score += of_score
+        confidence_factors.append(order_flow.confidence)
     
-    # 4. MTF Alignment (max 15)
-    alignment_score = mtf_alignment * 5
+    # 5. MTF Alignment (max 10)
+    alignment_score = mtf_alignment * 3.33  # 1->3.33, 2->6.67, 3->10
+    alignment_score = min(10, alignment_score)
     score += alignment_score
-    if mtf_alignment == 3:
-        confidence_factors.append(95)
-    elif mtf_alignment == 2:
-        confidence_factors.append(75)
+    confidence_factors.append(50 + mtf_alignment * 15)
     
-    # 5. Volume Profile (max 10)
+    # 6. Volume Profile (max 10)
     if volume_profile:
         vp_score = 0
         if volume_profile.current_position == "BELOW_VALUE":
@@ -3196,34 +3243,24 @@ def calculate_quantum_score(
         score += vp_score
         confidence_factors.append(75 if vp_score > 0 else 50)
     
-    # 6. RSI (max 5)
+    # 7. RSI (max 5)
     if 'rsi' in df.columns:
         rsi = safe_float(df['rsi'].iloc[-1])
         if 30 < rsi < 70:
-            score += 5
-            confidence_factors.append(65)
+            rsi_score = 5
+        else:
+            rsi_score = 0
+        score += rsi_score
+        confidence_factors.append(65)
     
-    # 7. OB Freshness (max 5)
-    if market_structure.order_block:
-        freshness = market_structure.order_block.get('freshness', 100)
-        if freshness < 5:
-            score += 5
-            confidence_factors.append(90)
-        elif freshness < 10:
-            score += 3
-            confidence_factors.append(70)
-    
-    # 8. Extra bonus: BELOW_VALUE + BULLISH_FLOW (if both true)
+    # 8. Extra bonus: BELOW_VALUE + BULLISH_FLOW (max 2)
     if (volume_profile and volume_profile.current_position == "BELOW_VALUE" and
         order_flow and order_flow.signal == "BULLISH"):
-        score += 5
+        score += 2
         confidence_factors.append(95)
     
-    # 9. Trend strength bonus
-    if market_structure.trend_strength > 80:
-        score += 5
-    
-    quantum_score = max(0.0, min(100.0, score))
+    # Cap score
+    quantum_score = min(100, max(0, score))
     
     confidence = np.mean(confidence_factors) if confidence_factors else 50.0
     confidence = min(100, confidence * 0.9)
@@ -3275,16 +3312,27 @@ def compute_sl_and_tp_from_structure(entry: float, market_structure: MarketStruc
     
     return sl, tp1, tp2, tp3
 
-# ===================== ASYNC POSITION SIZING WITH EDGE ENGINE =====================
-async def calculate_position_size(entry: float, sl: float, account_size: Optional[float] = None) -> Tuple[float, float]:
+# ===================== ASYNC POSITION SIZING WITH DYNAMIC RISK (BY SCORE) =====================
+async def calculate_position_size(entry: float, sl: float, account_size: Optional[float] = None, quantum_score: float = 0.0) -> Tuple[float, float]:
     if account_size is None:
         account_size = CONFIG["ACCOUNT_SIZE_USDT"]
     
     if not validate_price(entry) or not validate_price(sl) or sl >= entry:
         return 0.0, 0.0
     
-    # Base risk amount from config
-    base_risk_amount = account_size * (CONFIG["RISK_PER_TRADE_PCT"] / 100)
+    # [IMPROVEMENT] Dynamic risk based on quantum_score
+    if quantum_score < 68:
+        risk_pct = 0.7
+    elif quantum_score <= 72:
+        risk_pct = 0.7
+    elif quantum_score <= 80:
+        risk_pct = 1.0
+    elif quantum_score <= 88:
+        risk_pct = 1.3
+    else:
+        risk_pct = 1.6
+    
+    base_risk_amount = account_size * (risk_pct / 100)
     
     # === EDGE ENGINE: APPLY RISK MULTIPLIER ===
     try:
@@ -3392,7 +3440,7 @@ def should_run_order_flow(symbol: str, mtf_alignment: int, precheck_score: float
         return True
     
     if mtf_alignment == 2 and CONFIG.get("ORDER_FLOW_ENABLE_FOR_ALIGNMENT_2_IF_STRONG_SCORE", True):
-        if precheck_score >= safe_float(CONFIG.get("ORDER_FLOW_PRECHECK_MIN_SCORE", 65.0), 65.0):
+        if precheck_score >= safe_float(CONFIG.get("ORDER_FLOW_PRECHECK_MIN_SCORE", 68.0), 68.0):
             return True
     
     if mtf_alignment >= 2 and CONFIG.get("ORDER_FLOW_SAMPLING_ENABLED", True):
@@ -3402,6 +3450,66 @@ def should_run_order_flow(symbol: str, mtf_alignment: int, precheck_score: float
             return True
     
     return False
+
+# ===================== BTC CORRELATION FILTER =====================
+async def get_btc_correlation(exchange, symbol: str) -> float:
+    """Calculate correlation between symbol and BTC/USDT over last 50 1h candles."""
+    cache_key = f"{symbol}_BTC_corr"
+    now = time.time()
+    if cache_key in bot.correlation_cache:
+        corr, ts = bot.correlation_cache[cache_key]
+        if now - ts < 3600:  # 1 hour cache
+            return corr
+    
+    try:
+        # Fetch BTC data
+        btc_data = await cache.get_ohlcv(exchange, "BTC/USDT", "1h", 50)
+        if not btc_data or len(btc_data) < 20:
+            return 0.0
+        btc_df = pd.DataFrame(btc_data, columns=['t','open','high','low','close','volume'])
+        
+        # Fetch symbol data
+        sym_data = await cache.get_ohlcv(exchange, symbol, "1h", 50)
+        if not sym_data or len(sym_data) < 20:
+            return 0.0
+        sym_df = pd.DataFrame(sym_data, columns=['t','open','high','low','close','volume'])
+        
+        # Align by timestamp (simple: assume same length, latest)
+        if len(btc_df) != len(sym_df):
+            min_len = min(len(btc_df), len(sym_df))
+            btc_df = btc_df.iloc[-min_len:]
+            sym_df = sym_df.iloc[-min_len:]
+        
+        # Compute returns
+        btc_returns = btc_df['close'].pct_change().dropna()
+        sym_returns = sym_df['close'].pct_change().dropna()
+        
+        if len(btc_returns) < 10 or len(sym_returns) < 10:
+            return 0.0
+        
+        # Align lengths again after dropna
+        min_len = min(len(btc_returns), len(sym_returns))
+        btc_returns = btc_returns.iloc[-min_len:]
+        sym_returns = sym_returns.iloc[-min_len:]
+        
+        # Compute correlation
+        if SCIPY_AVAILABLE:
+            corr, _ = stats.pearsonr(btc_returns, sym_returns)
+        else:
+            # Manual Pearson
+            btc_mean = np.mean(btc_returns)
+            sym_mean = np.mean(sym_returns)
+            num = np.sum((btc_returns - btc_mean) * (sym_returns - sym_mean))
+            den = np.sqrt(np.sum((btc_returns - btc_mean)**2) * np.sum((sym_returns - sym_mean)**2))
+            corr = num / den if den != 0 else 0.0
+        
+        corr = safe_float(corr, 0.0)
+        bot.correlation_cache[cache_key] = (corr, now)
+        return corr
+    
+    except Exception as e:
+        logger.error(f"[BTC Correlation Error] {symbol}: {str(e)[:100]}")
+        return 0.0
 
 # ===================== BTC FILTER SPECIFIC =====================
 async def check_btc_filter(exchange) -> bool:
@@ -3457,8 +3565,14 @@ async def generate_quantum_signal(exchange, symbol: str) -> Optional[QuantumSign
             except Exception:
                 pass
         
-        # BTC Filter
+        # BTC Filter (general)
         if not await check_btc_filter(exchange):
+            return None
+        
+        # [IMPROVEMENT] BTC Correlation Filter
+        corr = await get_btc_correlation(exchange, symbol)
+        if corr < 0.2:
+            logger.info(f"[BTC Correlation] {symbol} correlation {corr:.2f} < 0.2 - skipping")
             return None
         
         mtf = await analyze_multi_timeframe(exchange, symbol)
@@ -3476,6 +3590,16 @@ async def generate_quantum_signal(exchange, symbol: str) -> Optional[QuantumSign
         if CONFIG["LONG_ONLY"] and structure_1h.structure != "BULLISH":
             return None
         
+        # [IMPROVEMENT] Volatility filter: 15m ATR% > 6% reject
+        if 'atr' in df_15m.columns and 'close' in df_15m.columns:
+            atr_15m = df_15m['atr'].iloc[-1]
+            price_15m = df_15m['close'].iloc[-1]
+            if price_15m > 0:
+                atr_pct_15m = (atr_15m / price_15m) * 100
+                if atr_pct_15m > CONFIG.get("MAX_ATR_PCT_15M", 6.0):
+                    logger.info(f"[Volatility Filter] {symbol} 15m ATR% {atr_pct_15m:.2f}% > {CONFIG['MAX_ATR_PCT_15M']}% - skipping")
+                    return None
+        
         ob = structure_15m.order_block if (structure_15m and structure_15m.order_block) else None
         lg = liquidity_grab if (liquidity_grab and liquidity_grab.detected and liquidity_grab.grab_type == "BULLISH") else None
         
@@ -3485,8 +3609,9 @@ async def generate_quantum_signal(exchange, symbol: str) -> Optional[QuantumSign
             prev_high = df_5m['high'].iloc[-2]
             prev_low = df_5m['low'].iloc[-2]
             mid = (prev_high + prev_low) / 2.0
-            if last_close < mid:
-                logger.info(f"[Micro Structure] {symbol} rejected: last close {last_close:.6f} below midpoint {mid:.6f}")
+            # [IMPROVEMENT] Add volume condition
+            if last_close < mid and df_5m['volume'].iloc[-1] <= df_5m['volume'].iloc[-2]:
+                logger.info(f"[Micro Structure] {symbol} rejected: last close {last_close:.6f} below midpoint {mid:.6f} and volume not increasing")
                 return None
         
         ok_accept, reason = price_acceptance_gate_5m(df_5m, ob, lg)
@@ -3511,15 +3636,11 @@ async def generate_quantum_signal(exchange, symbol: str) -> Optional[QuantumSign
         if sl == 0:
             return None
         
-        position_size_usdt, position_size_pct = await calculate_position_size(entry, sl)
-        if position_size_usdt == 0:
-            return None
-        
-        # Momentum Confirmation (RSI 5m)
+        # [IMPROVEMENT] RSI window: 45-68
         if 'rsi' in df_5m.columns:
             rsi_5m = df_5m['rsi'].iloc[-1]
-            if rsi_5m < 45:
-                logger.info(f"[Momentum] {symbol} rejected: RSI 5m = {rsi_5m:.1f} < 45")
+            if rsi_5m < 45 or rsi_5m > 68:
+                logger.info(f"[Momentum] {symbol} rejected: RSI 5m = {rsi_5m:.1f} outside 45-68")
                 return None
         
         pre_qs, pre_conf, pre_class = calculate_quantum_score(
@@ -3541,11 +3662,15 @@ async def generate_quantum_signal(exchange, symbol: str) -> Optional[QuantumSign
         order_flow = None
         if should_run_order_flow(symbol, mtf['alignment'], pre_qs, int(STATS.get("loop_count", 0))):
             if CONFIG.get("ORDER_FLOW_ENABLED", True):
-                allow_low = (mtf['alignment'] == 2 and pre_qs >= 65) or (mtf['alignment'] == 1 and pre_qs >= 85)
+                allow_low = (mtf['alignment'] == 2 and pre_qs >= 68) or (mtf['alignment'] == 1 and pre_qs >= 85)
                 order_flow = await analyze_order_flow(exchange, symbol, mtf['alignment'], allow_low_alignment=allow_low)
         
-        if lg and order_flow and order_flow.signal == "NEUTRAL":
-            logger.info(f"[Signal] {symbol} rejected: Liquidity Grab with Neutral Order Flow")
+        # [IMPROVEMENT] Order Flow + Liquidity Grab fix
+        if lg and order_flow and order_flow.signal == "BEARISH":
+            logger.info(f"[Signal] {symbol} rejected: Liquidity Grab with Bearish Order Flow")
+            return None
+        if not lg and order_flow and order_flow.signal != "BULLISH":
+            logger.info(f"[Signal] {symbol} rejected: No Liquidity Grab and Order Flow not BULLISH")
             return None
         
         volume_profile = None
@@ -3562,6 +3687,11 @@ async def generate_quantum_signal(exchange, symbol: str) -> Optional[QuantumSign
         )
         
         if quantum_score < CONFIG["MIN_QUANTUM_SCORE"]:
+            return None
+        
+        # [IMPROVEMENT] Now compute position size using the final quantum_score
+        position_size_usdt, position_size_pct = await calculate_position_size(entry, sl, quantum_score=quantum_score)
+        if position_size_usdt == 0:
             return None
         
         STATS["signals_generated"] += 1
@@ -3649,7 +3779,7 @@ def format_quantum_signal(signal: QuantumSignal) -> str:
 ━━━━━━━━━━━━━━━━
 • الحجم: ${signal.position_size_usdt:.2f}
 • % من الحساب: {signal.position_size_pct:.2f}%
-• المخاطرة: {CONFIG['RISK_PER_TRADE_PCT']}%
+• المخاطرة: {signal.position_size_usdt / CONFIG['ACCOUNT_SIZE_USDT'] * 100:.2f}%
 
 📊 التحليل الكمي
 ━━━━━━━━━━━━━━━━
@@ -3754,19 +3884,20 @@ async def get_filtered_symbols(exchange) -> List[str]:
             volume = safe_float(ticker.get('quoteVolume'), 0)
             price = safe_float(ticker.get('last'), 0)
             
-            if (volume < 50000 or
-                price > 1000 or
-                not validate_price(price)):
+            # [IMPROVEMENT] New filters: quoteVolume > 2,000,000, price >= 0.00001
+            if volume < 2_000_000:
+                continue
+            if price < 0.00001:
+                continue
+            if price > 1000:
                 continue
             
             score = min(volume / 1_000_000, 50)
-            if 0 < price < 0.0001:
-                score *= 0.5
-            
             filtered.append((symbol, score))
         
         filtered.sort(key=lambda x: x[1], reverse=True)
-        return [s for s, _ in filtered[:200]]
+        # [IMPROVEMENT] Limit to top 50
+        return [s for s, _ in filtered[:50]]
     
     except Exception as e:
         logger.error(f"[Symbol Filter Error] {str(e)}")
@@ -3968,6 +4099,10 @@ async def execute_live_entry_if_enabled(exchange, signal: QuantumSignal) -> Tupl
         is_paper=False,
         execution_mode="LIVE",
         entry_assumed=False,
+        # [IMPROVEMENT] Store order block and liquidity grab levels
+        order_block_low=signal.market_structure.order_block.get('body_low', signal.market_structure.order_block.get('low', 0.0)) if signal.market_structure.order_block else 0.0,
+        order_block_high=signal.market_structure.order_block.get('body_high', signal.market_structure.order_block.get('high', 0.0)) if signal.market_structure.order_block else 0.0,
+        liquidity_grab_level=signal.liquidity_grab.grab_level if signal.liquidity_grab else 0.0,
     )
     
     if CONFIG.get("LIVE_PLACE_SL_ORDER"):
@@ -4086,6 +4221,10 @@ async def process_symbol_batch(exchange, symbols: List[str]) -> int:
                         entry_assumed=True,
                         entry_filled=True,
                         entry_fill_amount=entry_fill_amount,
+                        # [IMPROVEMENT] Store order block and liquidity grab levels
+                        order_block_low=signal.market_structure.order_block.get('body_low', signal.market_structure.order_block.get('low', 0.0)) if signal.market_structure.order_block else 0.0,
+                        order_block_high=signal.market_structure.order_block.get('body_high', signal.market_structure.order_block.get('high', 0.0)) if signal.market_structure.order_block else 0.0,
+                        liquidity_grab_level=signal.liquidity_grab.grab_level if signal.liquidity_grab else 0.0,
                     )
                     
                     if not await bot.get_trade_lock(symbol):
@@ -4179,8 +4318,14 @@ async def _monitor_active_trades_internal(exchange):
                 await partial_exit(symbol, trade, current_price, "TP1",
                                 CONFIG["TP1_EXIT_PCT"], r_multiple, exchange=exchange)
             
-            # Dynamic Break‑Even
-            be_at_r = max(1.2, 0.5 * trade.quantum_score / 100)
+            # [IMPROVEMENT] Dynamic Break‑Even based on quantum_score
+            if trade.quantum_score < 75:
+                be_at_r = 1.3
+            elif trade.quantum_score <= 85:
+                be_at_r = 1.1
+            else:
+                be_at_r = 1.0
+            
             if r_multiple >= be_at_r and not trade.be_moved:
                 if trade.atr > 0:
                     new_sl = trade.entry + (trade.atr * CONFIG["BE_ATR_MULT"])
@@ -4205,29 +4350,39 @@ async def _monitor_active_trades_internal(exchange):
                     
                     logger.info(f"[BE] {symbol} - internal SL moved to breakeven using ATR")
             
+            # [IMPROVEMENT] Trailing stop with protection
             elif r_multiple >= CONFIG["TRAIL_START_R"] and trade.be_moved:
                 atr_estimate = trade.atr if trade.atr > 0 else (trade.tp1 - trade.entry) / CONFIG["TP1_RR"]
                 new_sl = current_price - (atr_estimate * CONFIG["TRAIL_ATR_MULT"])
                 
                 if new_sl > trade.current_sl:
-                    updates = {
-                        'current_sl': new_sl,
-                        'trailing_active': True,
-                        '_version': trade._version + 1
-                    }
+                    # Protect order block: do not move stop inside order block
+                    if trade.order_block_low > 0 and new_sl > trade.order_block_low:
+                        new_sl = min(new_sl, trade.order_block_low - 1e-8)
+                    # Protect liquidity grab level: do not move stop above it (since it's support)
+                    if trade.liquidity_grab_level > 0 and new_sl > trade.liquidity_grab_level:
+                        new_sl = min(new_sl, trade.liquidity_grab_level - 1e-8)
                     
-                    if db_manager.update_trade_with_version(symbol, updates, trade._version):
-                        if await bot.get_trade_lock(symbol):
-                            try:
-                                if symbol in ACTIVE_TRADES:
-                                    ACTIVE_TRADES[symbol].current_sl = new_sl
-                                    ACTIVE_TRADES[symbol].trailing_active = True
-                                    ACTIVE_TRADES[symbol]._version += 1
-                            finally:
-                                bot.release_trade_lock(symbol)
+                    if new_sl > trade.current_sl:
+                        updates = {
+                            'current_sl': new_sl,
+                            'trailing_active': True,
+                            '_version': trade._version + 1
+                        }
+                        
+                        if db_manager.update_trade_with_version(symbol, updates, trade._version):
+                            if await bot.get_trade_lock(symbol):
+                                try:
+                                    if symbol in ACTIVE_TRADES:
+                                        ACTIVE_TRADES[symbol].current_sl = new_sl
+                                        ACTIVE_TRADES[symbol].trailing_active = True
+                                        ACTIVE_TRADES[symbol]._version += 1
+                                finally:
+                                    bot.release_trade_lock(symbol)
                 
                 continue
         
+        # Paper/Signal mode: same logic but without exchange actions
         if current_price <= trade.current_sl:
             await close_trade_full(symbol, current_price, "SL")
             continue
@@ -4241,7 +4396,14 @@ async def _monitor_active_trades_internal(exchange):
             await partial_exit(symbol, trade, current_price, "TP1",
                             CONFIG["TP1_EXIT_PCT"], r_multiple)
         
-        be_at_r = max(1.2, 0.5 * trade.quantum_score / 100)
+        # [IMPROVEMENT] Dynamic Break‑Even for paper/signal
+        if trade.quantum_score < 75:
+            be_at_r = 1.3
+        elif trade.quantum_score <= 85:
+            be_at_r = 1.1
+        else:
+            be_at_r = 1.0
+        
         if r_multiple >= be_at_r and not trade.be_moved:
             if trade.atr > 0:
                 new_sl = trade.entry + (trade.atr * CONFIG["BE_ATR_MULT"])
@@ -4266,26 +4428,35 @@ async def _monitor_active_trades_internal(exchange):
                 
                 logger.info(f"[BE] {symbol} - SL moved to breakeven using ATR")
         
+        # [IMPROVEMENT] Trailing stop for paper/signal
         elif r_multiple >= CONFIG["TRAIL_START_R"] and trade.be_moved:
             atr_estimate = trade.atr if trade.atr > 0 else (trade.tp1 - trade.entry) / CONFIG["TP1_RR"]
             new_sl = current_price - (atr_estimate * CONFIG["TRAIL_ATR_MULT"])
             
             if new_sl > trade.current_sl:
-                updates = {
-                    'current_sl': new_sl,
-                    'trailing_active': True,
-                    '_version': trade._version + 1
-                }
+                # Protect order block
+                if trade.order_block_low > 0 and new_sl > trade.order_block_low:
+                    new_sl = min(new_sl, trade.order_block_low - 1e-8)
+                # Protect liquidity grab level
+                if trade.liquidity_grab_level > 0 and new_sl > trade.liquidity_grab_level:
+                    new_sl = min(new_sl, trade.liquidity_grab_level - 1e-8)
                 
-                if db_manager.update_trade_with_version(symbol, updates, trade._version):
-                    if await bot.get_trade_lock(symbol):
-                        try:
-                            if symbol in ACTIVE_TRADES:
-                                ACTIVE_TRADES[symbol].current_sl = new_sl
-                                ACTIVE_TRADES[symbol].trailing_active = True
-                                ACTIVE_TRADES[symbol]._version += 1
-                        finally:
-                            bot.release_trade_lock(symbol)
+                if new_sl > trade.current_sl:
+                    updates = {
+                        'current_sl': new_sl,
+                        'trailing_active': True,
+                        '_version': trade._version + 1
+                    }
+                    
+                    if db_manager.update_trade_with_version(symbol, updates, trade._version):
+                        if await bot.get_trade_lock(symbol):
+                            try:
+                                if symbol in ACTIVE_TRADES:
+                                    ACTIVE_TRADES[symbol].current_sl = new_sl
+                                    ACTIVE_TRADES[symbol].trailing_active = True
+                                    ACTIVE_TRADES[symbol]._version += 1
+                            finally:
+                                bot.release_trade_lock(symbol)
 
 async def fetch_ticker_with_lock(exchange, symbol):
     try:
@@ -4610,17 +4781,20 @@ async def generate_performance_report() -> str:
 • SL on Exchange: {'ON' if CONFIG.get('LIVE_PLACE_SL_ORDER') else 'OFF'}
 
 ✅ التحسينات المؤسسية المطبقة
-• ✅ تعديلات القيم الصارمة (OB freshness 8, wick ratio 0.45, volume multiplier 1.7, LG confidence 70, cooldown 900, A+ cap 7, spread 0.15, ATR% 5.5, trend strength 65)
+• ✅ تعديلات القيم الصارمة (trend strength 70, min score 68, spread 0.10, cooldown 1200)
 • ✅ تفعيل أمر SL على المنصة افتراضياً
 • ✅ تحسين Order Flow Sampling (التشغيل دائماً لـ alignment≥2 إذا score>65)
-• ✅ Momentum Confirmation (رفض LONG إذا RSI 5m < 45)
-• ✅ Micro Structure Protection (رفض LONG إذا آخر close أقل من midpoint الشمعة السابقة)
+• ✅ RSI window (45-68)
+• ✅ Micro Structure Protection (مع شرط الحجم)
 • ✅ Slippage Recheck بعد التنفيذ (إغلاق الصفقة إذا RR الفعلي < 2.5)
 • ✅ Consecutive Loss Guard (حظر الرمز 6 ساعات بعد خسارتين متتاليتين خلال 24 ساعة)
-• ✅ Dynamic Break‑Even (BE بناءً على quantum_score)
-• ✅ BTC Correlation Filter (رفض LONG إذا BTC 1h RSI<40 أو close تحت EMA50)
+• ✅ Dynamic Break‑Even (حسب النقاط)
+• ✅ BTC Correlation Filter (corr < 0.2 مرفوض)
 • ✅ مكافأة إضافية لـ BELOW_VALUE + BULLISH_FLOW
 • ✅ Edge Intelligence Engine (Self-monitoring, Self-risk adjusting, Self-protecting)
+• ✅ Trailing Stop مع حماية مناطق السيولة والأوردر بلوك
+• ✅ Symbol Filter (أعلى 50 سيولة، حجم > 2M, سعر >= 0.00001)
+• ✅ Market Volatility Filter (ATR% 15m > 6% مرفوض)
 
 🧯 Daily Circuit
 • Enabled: {'ON' if CONFIG.get('ENABLE_DAILY_MAX_LOSS', True) else 'OFF'}
@@ -4874,17 +5048,21 @@ async def main_loop(exchange):
         logger.info(f"METRICS COLLECTOR: ✅ (مع تصحيح success)")
         logger.info(f"EXPONENTIAL BACKOFF RETRY: ✅")
         logger.info("✅ جميع التحسينات الجديدة مدمجة:")
-        logger.info("  1. تعديلات القيم الصارمة (OB freshness 8, wick ratio 0.45, volume multiplier 1.7, LG confidence 70, cooldown 900, A+ cap 7, spread 0.15, ATR% 5.5, trend strength 65)")
+        logger.info("  1. تعديلات القيم الصارمة (trend strength 70, min score 68, spread 0.10, cooldown 1200)")
         logger.info("  2. تفعيل أمر SL على المنصة افتراضياً")
         logger.info("  3. تحسين Order Flow Sampling (التشغيل دائماً لـ alignment≥2 إذا score>65)")
-        logger.info("  4. Momentum Confirmation (رفض LONG إذا RSI 5m < 45)")
-        logger.info("  5. Micro Structure Protection (رفض LONG إذا آخر close أقل من midpoint الشمعة السابقة)")
+        logger.info("  4. RSI window (45-68)")
+        logger.info("  5. Micro Structure Protection (مع شرط الحجم)")
         logger.info("  6. Slippage Recheck بعد التنفيذ (إغلاق الصفقة إذا RR الفعلي < 2.5)")
         logger.info("  7. Consecutive Loss Guard (حظر الرمز 6 ساعات بعد خسارتين متتاليتين خلال 24 ساعة)")
-        logger.info("  8. Dynamic Break‑Even (BE بناءً على quantum_score)")
-        logger.info("  9. BTC Correlation Filter (رفض LONG إذا BTC 1h RSI<40 أو close تحت EMA50)")
+        logger.info("  8. Dynamic Break‑Even (حسب النقاط)")
+        logger.info("  9. BTC Correlation Filter (corr < 0.2 مرفوض)")
         logger.info(" 10. مكافأة إضافية لـ BELOW_VALUE + BULLISH_FLOW")
         logger.info(" 11. Edge Intelligence Engine (Self-monitoring, Self-risk adjusting, Self-protecting)")
+        logger.info(" 12. Trailing Stop مع حماية مناطق السيولة والأوردر بلوك")
+        logger.info(" 13. Symbol Filter (أعلى 50 سيولة، حجم > 2M, سعر >= 0.00001)")
+        logger.info(" 14. Market Volatility Filter (ATR% 15m > 6% مرفوض)")
+        logger.info(" 15. Quantum Score Rebalance (الأوزان الجديدة)")
         logger.info("="*70)
         
         db_manager.init_database()
@@ -4939,17 +5117,21 @@ async def main_loop(exchange):
 • SL on Exchange: {'ON' if CONFIG.get('LIVE_PLACE_SL_ORDER') else 'OFF'}
 
 ✅ التحسينات المؤسسية المطبقة
-• ✅ تعديلات القيم الصارمة (OB freshness 8, wick ratio 0.45, volume multiplier 1.7, LG confidence 70, cooldown 900, A+ cap 7, spread 0.15, ATR% 5.5, trend strength 65)
+• ✅ تعديلات القيم الصارمة (trend strength 70, min score 68, spread 0.10, cooldown 1200)
 • ✅ تفعيل أمر SL على المنصة افتراضياً
 • ✅ تحسين Order Flow Sampling (التشغيل دائماً لـ alignment≥2 إذا score>65)
-• ✅ Momentum Confirmation (رفض LONG إذا RSI 5m < 45)
-• ✅ Micro Structure Protection (رفض LONG إذا آخر close أقل من midpoint الشمعة السابقة)
+• ✅ RSI window (45-68)
+• ✅ Micro Structure Protection (مع شرط الحجم)
 • ✅ Slippage Recheck بعد التنفيذ (إغلاق الصفقة إذا RR الفعلي < 2.5)
 • ✅ Consecutive Loss Guard (حظر الرمز 6 ساعات بعد خسارتين متتاليتين خلال 24 ساعة)
-• ✅ Dynamic Break‑Even (BE بناءً على quantum_score)
-• ✅ BTC Correlation Filter (رفض LONG إذا BTC 1h RSI<40 أو close تحت EMA50)
+• ✅ Dynamic Break‑Even (حسب النقاط)
+• ✅ BTC Correlation Filter (corr < 0.2 مرفوض)
 • ✅ مكافأة إضافية لـ BELOW_VALUE + BULLISH_FLOW
 • ✅ Edge Intelligence Engine (Self-monitoring, Self-risk adjusting, Self-protecting)
+• ✅ Trailing Stop مع حماية مناطق السيولة والأوردر بلوك
+• ✅ Symbol Filter (أعلى 50 سيولة، حجم > 2M, سعر >= 0.00001)
+• ✅ Market Volatility Filter (ATR% 15m > 6% مرفوض)
+• ✅ Quantum Score Rebalance (الأوزان الجديدة)
 
 🧯 Daily Circuit
 • Enabled: {'ON' if CONFIG.get('ENABLE_DAILY_MAX_LOSS', True) else 'OFF'}
