@@ -12,11 +12,15 @@ WITH EDGE INTELLIGENCE ENGINE
 - Dynamic Break‑Even (حسب النقاط)
 - Trailing Stop مع حماية مناطق السيولة والأوردر بلوك
 - Symbol Filter (أعلى 50 سيولة، حجم > 2M, سعر >= 0.00001)
-- BTC Correlation Filter (corr < 0.2 مرفوض)
+- BTC Correlation Filter (corr < 0.2 مرفوض، مع تجاهل فشل API)
 - Market Volatility Filter (ATR% 15m > 6% مرفوض)
 - Spread Filter (0.10%)
 - Cooldown 1200 ثانية
 - Max Symbol Scan 50
+- إصلاح NameError في detect_liquidity_grab
+- إصلاح BTC correlation filter لتجاهل أخطاء API
+- حماية حجم الصفقة من الانزلاق السعري بعد التنفيذ
+- تنظيف دوري للـ analysis_cache
 جميع التغييرات مدمجة بدقة مع الحفاظ على الأنظمة الأساسية.
 """
 
@@ -2873,6 +2877,8 @@ def detect_liquidity_grab(df: pd.DataFrame) -> Optional[LiquidityGrab]:
         return None
     
     try:
+        # [FIX] Initialize range_condition to avoid NameError
+        range_condition = False
         last_candle = df.iloc[-1]
         prev_candle = df.iloc[-2] if len(df) > 1 else last_candle
         
@@ -3452,8 +3458,11 @@ def should_run_order_flow(symbol: str, mtf_alignment: int, precheck_score: float
     return False
 
 # ===================== BTC CORRELATION FILTER =====================
-async def get_btc_correlation(exchange, symbol: str) -> float:
-    """Calculate correlation between symbol and BTC/USDT over last 50 1h candles."""
+async def get_btc_correlation(exchange, symbol: str) -> Optional[float]:
+    """
+    Calculate correlation between symbol and BTC/USDT over last 50 1h candles.
+    Returns None on API failure to skip the filter.
+    """
     cache_key = f"{symbol}_BTC_corr"
     now = time.time()
     if cache_key in bot.correlation_cache:
@@ -3465,13 +3474,13 @@ async def get_btc_correlation(exchange, symbol: str) -> float:
         # Fetch BTC data
         btc_data = await cache.get_ohlcv(exchange, "BTC/USDT", "1h", 50)
         if not btc_data or len(btc_data) < 20:
-            return 0.0
+            return None
         btc_df = pd.DataFrame(btc_data, columns=['t','open','high','low','close','volume'])
         
         # Fetch symbol data
         sym_data = await cache.get_ohlcv(exchange, symbol, "1h", 50)
         if not sym_data or len(sym_data) < 20:
-            return 0.0
+            return None
         sym_df = pd.DataFrame(sym_data, columns=['t','open','high','low','close','volume'])
         
         # Align by timestamp (simple: assume same length, latest)
@@ -3485,7 +3494,7 @@ async def get_btc_correlation(exchange, symbol: str) -> float:
         sym_returns = sym_df['close'].pct_change().dropna()
         
         if len(btc_returns) < 10 or len(sym_returns) < 10:
-            return 0.0
+            return None
         
         # Align lengths again after dropna
         min_len = min(len(btc_returns), len(sym_returns))
@@ -3509,7 +3518,7 @@ async def get_btc_correlation(exchange, symbol: str) -> float:
     
     except Exception as e:
         logger.error(f"[BTC Correlation Error] {symbol}: {str(e)[:100]}")
-        return 0.0
+        return None
 
 # ===================== BTC FILTER SPECIFIC =====================
 async def check_btc_filter(exchange) -> bool:
@@ -3569,9 +3578,9 @@ async def generate_quantum_signal(exchange, symbol: str) -> Optional[QuantumSign
         if not await check_btc_filter(exchange):
             return None
         
-        # [IMPROVEMENT] BTC Correlation Filter
+        # [IMPROVEMENT] BTC Correlation Filter - skip if API fails
         corr = await get_btc_correlation(exchange, symbol)
-        if corr < 0.2:
+        if corr is not None and corr < 0.2:
             logger.info(f"[BTC Correlation] {symbol} correlation {corr:.2f} < 0.2 - skipping")
             return None
         
@@ -4079,6 +4088,22 @@ async def execute_live_entry_if_enabled(exchange, signal: QuantumSignal) -> Tupl
             # بيع فوري
             await market_sell_safe(exchange, signal.symbol, fill_amount, max_retries=2)
             return False, None
+    
+    # [FIX] Protect position sizing from slippage: compute actual risk amount and compare with intended
+    intended_position_base = signal.position_size_usdt / signal.entry
+    intended_risk_amount = intended_position_base * (signal.entry - signal.sl)
+    actual_risk_amount = fill_amount * (fill_price - adj_sl)
+    if actual_risk_amount > intended_risk_amount * 1.2:
+        logger.warning(f"[Slippage] {signal.symbol} actual risk {actual_risk_amount:.2f} > intended {intended_risk_amount:.2f} by >20%, closing immediately")
+        await send_telegram(
+            f"⚠️ تم إغلاق الصفقة بسبب انحراف المخاطرة بعد التنفيذ\n"
+            f"• الرمز: {escape_html(signal.symbol)}\n"
+            f"• المخاطرة الفعلية: {actual_risk_amount:.2f}\n"
+            f"• المخاطرة المستهدفة: {intended_risk_amount:.2f}\n"
+            f"• نسبة الانحراف: {actual_risk_amount/intended_risk_amount:.1f}x"
+        )
+        await market_sell_safe(exchange, signal.symbol, fill_amount, max_retries=2)
+        return False, None
     
     trade_state = TradeState(
         symbol=signal.symbol,
@@ -4789,7 +4814,7 @@ async def generate_performance_report() -> str:
 • ✅ Slippage Recheck بعد التنفيذ (إغلاق الصفقة إذا RR الفعلي < 2.5)
 • ✅ Consecutive Loss Guard (حظر الرمز 6 ساعات بعد خسارتين متتاليتين خلال 24 ساعة)
 • ✅ Dynamic Break‑Even (حسب النقاط)
-• ✅ BTC Correlation Filter (corr < 0.2 مرفوض)
+• ✅ BTC Correlation Filter (corr < 0.2 مرفوض، مع تجاهل فشل API)
 • ✅ مكافأة إضافية لـ BELOW_VALUE + BULLISH_FLOW
 • ✅ Edge Intelligence Engine (Self-monitoring, Self-risk adjusting, Self-protecting)
 • ✅ Trailing Stop مع حماية مناطق السيولة والأوردر بلوك
@@ -4941,6 +4966,10 @@ async def toggle_computational_features():
     
     if loop_count % 7 == 0:
         await cache.smart_cache_cleanup()
+    
+    # [FIX] Clean up analysis_cache periodically to prevent memory growth
+    if loop_count % 10 == 0:
+        bot.analysis_cache.clear()
 
 # ===================== HEALTH CHECK ENDPOINT =====================
 async def health_check_handler(request):
@@ -5056,7 +5085,7 @@ async def main_loop(exchange):
         logger.info("  6. Slippage Recheck بعد التنفيذ (إغلاق الصفقة إذا RR الفعلي < 2.5)")
         logger.info("  7. Consecutive Loss Guard (حظر الرمز 6 ساعات بعد خسارتين متتاليتين خلال 24 ساعة)")
         logger.info("  8. Dynamic Break‑Even (حسب النقاط)")
-        logger.info("  9. BTC Correlation Filter (corr < 0.2 مرفوض)")
+        logger.info("  9. BTC Correlation Filter (corr < 0.2 مرفوض، مع تجاهل فشل API)")
         logger.info(" 10. مكافأة إضافية لـ BELOW_VALUE + BULLISH_FLOW")
         logger.info(" 11. Edge Intelligence Engine (Self-monitoring, Self-risk adjusting, Self-protecting)")
         logger.info(" 12. Trailing Stop مع حماية مناطق السيولة والأوردر بلوك")
@@ -5125,7 +5154,7 @@ async def main_loop(exchange):
 • ✅ Slippage Recheck بعد التنفيذ (إغلاق الصفقة إذا RR الفعلي < 2.5)
 • ✅ Consecutive Loss Guard (حظر الرمز 6 ساعات بعد خسارتين متتاليتين خلال 24 ساعة)
 • ✅ Dynamic Break‑Even (حسب النقاط)
-• ✅ BTC Correlation Filter (corr < 0.2 مرفوض)
+• ✅ BTC Correlation Filter (corr < 0.2 مرفوض، مع تجاهل فشل API)
 • ✅ مكافأة إضافية لـ BELOW_VALUE + BULLISH_FLOW
 • ✅ Edge Intelligence Engine (Self-monitoring, Self-risk adjusting, Self-protecting)
 • ✅ Trailing Stop مع حماية مناطق السيولة والأوردر بلوك
