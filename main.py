@@ -18,9 +18,15 @@ WITH EDGE INTELLIGENCE ENGINE
 - Cooldown 1200 ثانية
 - Max Symbol Scan 50
 - إصلاح NameError في detect_liquidity_grab
-- إصلاح BTC correlation filter لتجاهل أخطاء API
+- إصلاح BTC correlation filter لتجاهل أخطاب API
 - حماية حجم الصفقة من الانزلاق السعري بعد التنفيذ
 - تنظيف دوري للـ analysis_cache
+- إضافة حماية انزلاق RR (حسب TP1_RR)
+- معالجة NaN في الارتباط وإرجاع None
+- إضافة MAX_SLIPPAGE_PCT
+- إضافة قاطع الدارة العام MAX_CONSECUTIVE_LOSSES
+- إضافة MIN_VOLUME_24H كمتغير إعدادات
+- تحسين التسجيل بوسوم ENTRY / FILL / TP / SL
 جميع التغييرات مدمجة بدقة مع الحفاظ على الأنظمة الأساسية.
 """
 
@@ -333,6 +339,7 @@ class TradingBot:
             "paper_trades_opened": 0,
             "loop_count": 0,
             "last_reset_date": None,
+            "global_consecutive_losses": 0,  # [IMPROVEMENT] Global consecutive losses
         }
         self.lock_manager = EnhancedLockManager()
         self.symbol_cooldown: Dict[str, float] = {}
@@ -929,6 +936,15 @@ CONFIG = {
     
     # [IMPROVEMENT] New volatility filter
     "MAX_ATR_PCT_15M": 6.0,
+
+    # [IMPROVEMENT] New slippage protection
+    "MAX_SLIPPAGE_PCT": 0.003,                    # 0.3% maximum slippage
+
+    # [IMPROVEMENT] Global consecutive losses circuit breaker
+    "MAX_CONSECUTIVE_LOSSES": 3,
+
+    # [IMPROVEMENT] Liquidity filter configurable
+    "MIN_VOLUME_24H": 2000000,
 }
 
 # ===================== TELEGRAM ENV AUTO-LOAD =====================
@@ -1515,6 +1531,7 @@ async def place_limit_buy_entry(exchange, symbol: str, price: float, amount: flo
         order = await exchange.create_order(symbol, "limit", "buy", amt, px)
         STATS["live_orders_placed"] += 1
         log_order_audit("LIMIT_BUY", symbol, px, amt, "PLACED")
+        logger.info(f"[ENTRY] Limit buy placed for {symbol}: price={px}, amount={amt}")
         return order
     except Exception as e:
         STATS["live_order_errors"] += 1
@@ -1533,6 +1550,7 @@ async def place_stop_loss_order(exchange, symbol: str, stop_price: float, amount
         await rate_limiter.wait_if_needed(weight=1)
         order = await exchange.create_order(symbol, order_type, "sell", amt, None, params)
         log_order_audit("STOP_LOSS", symbol, stop_price, amt, "PLACED")
+        logger.info(f"[SL] Stop loss placed for {symbol} at {stop_price}")
         return order
     except Exception as e:
         logger.error(f"[LIVE SL Order Error] {symbol}: {str(e)[:150]}")
@@ -1566,6 +1584,7 @@ async def wait_for_order_fill_or_cancel(exchange, symbol: str, order_id: str, ti
             if status == "closed" and amount > 0 and filled >= amount * 0.999:
                 STATS["live_orders_filled"] += 1
                 log_order_audit("LIMIT_BUY", symbol, last.get('price', 0), filled, "FILLED")
+                logger.info(f"[FILL] Order filled for {symbol}: price={last.get('price', 0)}, amount={filled}")
                 return True, last
             
             if status in ("canceled", "rejected", "expired"):
@@ -1587,6 +1606,7 @@ async def wait_for_order_fill_or_cancel(exchange, symbol: str, order_id: str, ti
         except Exception:
             pass
         log_order_audit("LIMIT_BUY", symbol, 0, 0, "TIMEOUT_CANCELED")
+        logger.info(f"[FILL] Order {order_id} for {symbol} timed out and canceled")
     except Exception as e:
         logger.warning(f"[LIVE Cancel Warn] {symbol}: {str(e)[:120]}")
     
@@ -1601,6 +1621,7 @@ async def market_sell(exchange, symbol: str, amount: float) -> Optional[Dict[str
         order = await exchange.create_order(symbol, "market", "sell", amt)
         STATS["live_sells_executed"] += 1
         log_order_audit("MARKET_SELL", symbol, 0, amt, "EXECUTED")
+        logger.info(f"[EXIT] Market sell executed for {symbol}: amount={amt}")
         return order
     except Exception as e:
         STATS["live_order_errors"] += 1
@@ -3461,7 +3482,7 @@ def should_run_order_flow(symbol: str, mtf_alignment: int, precheck_score: float
 async def get_btc_correlation(exchange, symbol: str) -> Optional[float]:
     """
     Calculate correlation between symbol and BTC/USDT over last 50 1h candles.
-    Returns None on API failure to skip the filter.
+    Returns None on API failure or if correlation is NaN.
     """
     cache_key = f"{symbol}_BTC_corr"
     now = time.time()
@@ -3511,6 +3532,11 @@ async def get_btc_correlation(exchange, symbol: str) -> Optional[float]:
             num = np.sum((btc_returns - btc_mean) * (sym_returns - sym_mean))
             den = np.sqrt(np.sum((btc_returns - btc_mean)**2) * np.sum((sym_returns - sym_mean)**2))
             corr = num / den if den != 0 else 0.0
+        
+        # [FIX] If correlation is NaN, return None
+        if np.isnan(corr):
+            logger.warning(f"[BTC Correlation] NaN for {symbol}, skipping filter")
+            return None
         
         corr = safe_float(corr, 0.0)
         bot.correlation_cache[cache_key] = (corr, now)
@@ -3578,7 +3604,7 @@ async def generate_quantum_signal(exchange, symbol: str) -> Optional[QuantumSign
         if not await check_btc_filter(exchange):
             return None
         
-        # [IMPROVEMENT] BTC Correlation Filter - skip if API fails
+        # [IMPROVEMENT] BTC Correlation Filter - skip if API fails or NaN
         corr = await get_btc_correlation(exchange, symbol)
         if corr is not None and corr < 0.2:
             logger.info(f"[BTC Correlation] {symbol} correlation {corr:.2f} < 0.2 - skipping")
@@ -3893,8 +3919,8 @@ async def get_filtered_symbols(exchange) -> List[str]:
             volume = safe_float(ticker.get('quoteVolume'), 0)
             price = safe_float(ticker.get('last'), 0)
             
-            # [IMPROVEMENT] New filters: quoteVolume > 2,000,000, price >= 0.00001
-            if volume < 2_000_000:
+            # [IMPROVEMENT] New filters: quoteVolume > MIN_VOLUME_24H, price >= 0.00001
+            if volume < CONFIG["MIN_VOLUME_24H"]:
                 continue
             if price < 0.00001:
                 continue
@@ -3978,6 +4004,14 @@ def is_symbol_blacklisted_loss(symbol: str) -> bool:
 async def execute_live_entry_if_enabled(exchange, signal: QuantumSignal) -> Tuple[bool, Optional[TradeState]]:
     if not is_live_trading_enabled():
         return True, None
+    
+    # [IMPROVEMENT] Global consecutive loss circuit breaker
+    if STATS.get("global_consecutive_losses", 0) >= CONFIG["MAX_CONSECUTIVE_LOSSES"]:
+        await send_telegram(
+            f"🛑 Global consecutive loss circuit breaker reached ({CONFIG['MAX_CONSECUTIVE_LOSSES']} losses). Stopping new entries.",
+            critical=True
+        )
+        return False, None
     
     if is_daily_loss_blocked():
         await send_telegram(
@@ -4071,21 +4105,34 @@ async def execute_live_entry_if_enabled(exchange, signal: QuantumSignal) -> Tupl
     fill_price = safe_float(final_order.get("average"), 0.0) or safe_float(final_order.get("price"), signal.entry)
     fill_amount = safe_float(final_order.get("filled"), 0.0) or amount_base
     
+    # [IMPROVEMENT] Slippage percent protection
+    slippage_pct = abs(fill_price - signal.entry) / signal.entry
+    if slippage_pct > CONFIG["MAX_SLIPPAGE_PCT"]:
+        logger.warning(f"[Slippage] {signal.symbol} slippage {slippage_pct:.4%} > {CONFIG['MAX_SLIPPAGE_PCT']:.2%}, closing immediately")
+        await send_telegram(
+            f"⚠️ تم إغلاق الصفقة بسبب انزلاق سعري كبير\n"
+            f"• الرمز: {escape_html(signal.symbol)}\n"
+            f"• الانزلاق: {slippage_pct:.4%}\n"
+            f"• الحد الأقصى: {CONFIG['MAX_SLIPPAGE_PCT']:.2%}"
+        )
+        await market_sell_safe(exchange, signal.symbol, fill_amount, max_retries=2)
+        return False, None
+    
     adj_sl, adj_tp1, adj_tp2, adj_tp3, adj_position_size = recalibrate_levels_on_fill(fill_price, signal)
     
-    # Slippage Recheck: إذا كان RR الفعلي للهدف الأول أقل من 2.5، نغلق الصفقة فوراً
+    # [IMPROVEMENT] RR slippage check based on TP1_RR
     actual_risk = fill_price - adj_sl
     if actual_risk > 0:
         actual_rr = (adj_tp1 - fill_price) / actual_risk
-        if actual_rr < 2.5:
-            logger.warning(f"[Slippage] {signal.symbol} actual RR {actual_rr:.2f} < 2.5, closing immediately")
+        min_allowed_rr = CONFIG["TP1_RR"] * 0.75
+        if actual_rr < min_allowed_rr:
+            logger.warning(f"[Slippage] {signal.symbol} actual RR {actual_rr:.2f} < {min_allowed_rr:.2f}, closing immediately")
             await send_telegram(
                 f"⚠️ تم إغلاق الصفقة بسبب انخفاض RR الفعلي بعد التنفيذ\n"
                 f"• الرمز: {escape_html(signal.symbol)}\n"
                 f"• RR الفعلي: {actual_rr:.2f}\n"
-                f"• الحد الأدنى: 2.5"
+                f"• الحد الأدنى: {min_allowed_rr:.2f}"
             )
-            # بيع فوري
             await market_sell_safe(exchange, signal.symbol, fill_amount, max_retries=2)
             return False, None
     
@@ -4579,10 +4626,13 @@ async def partial_exit(symbol: str, trade: TradeState, exit_price: float,
         
         if tp_level == "TP1":
             current_trade.tp1_hit = True
+            logger.info(f"[TP1] {symbol} hit at {fill_price}")
         elif tp_level == "TP2":
             current_trade.tp2_hit = True
+            logger.info(f"[TP2] {symbol} hit at {fill_price}")
         elif tp_level == "TP3":
             current_trade.tp3_hit = True
+            logger.info(f"[TP3] {symbol} hit at {fill_price}")
         
         current_trade._version += 1
         current_trade.is_exiting = False
@@ -4729,11 +4779,14 @@ async def close_trade_full(symbol: str, exit_price: float, exit_type: str, excha
     
     profit_pct = ((fill_price - entry) / entry) * 100
     
+    # [IMPROVEMENT] Update global consecutive losses
     if exit_type == "SL":
+        STATS["global_consecutive_losses"] = STATS.get("global_consecutive_losses", 0) + 1
         STATS["trades_lost"] += 1
         STATS["total_r_multiple"] += final_exit_r
         record_loss(symbol)   # تسجيل الخسارة المتتالية
     else:
+        STATS["global_consecutive_losses"] = 0  # reset on win
         STATS["trades_won"] += 1
         STATS["total_r_multiple"] += final_exit_r
     
@@ -4774,7 +4827,7 @@ async def close_trade_full(symbol: str, exit_price: float, exit_type: str, excha
     
     db_manager.remove_trade(symbol)
     
-    logger.info(f"[Trade Closed] {symbol} - {exit_type} - {profit_pct:+.2f}% - {final_exit_r:.2f}R (total {total_r:.2f}R)")
+    logger.info(f"[SL] {symbol} closed - {exit_type} - {profit_pct:+.2f}% - {final_exit_r:.2f}R (total {total_r:.2f}R)")
 
 # ===================== PERFORMANCE REPORT =====================
 async def generate_performance_report() -> str:
@@ -4811,15 +4864,19 @@ async def generate_performance_report() -> str:
 • ✅ تحسين Order Flow Sampling (التشغيل دائماً لـ alignment≥2 إذا score>65)
 • ✅ RSI window (45-68)
 • ✅ Micro Structure Protection (مع شرط الحجم)
-• ✅ Slippage Recheck بعد التنفيذ (إغلاق الصفقة إذا RR الفعلي < 2.5)
+• ✅ Slippage Recheck بعد التنفيذ (RR ديناميكي حسب TP1_RR)
 • ✅ Consecutive Loss Guard (حظر الرمز 6 ساعات بعد خسارتين متتاليتين خلال 24 ساعة)
 • ✅ Dynamic Break‑Even (حسب النقاط)
-• ✅ BTC Correlation Filter (corr < 0.2 مرفوض، مع تجاهل فشل API)
+• ✅ BTC Correlation Filter (corr < 0.2 مرفوض، مع تجاهل فشل API وNaN)
 • ✅ مكافأة إضافية لـ BELOW_VALUE + BULLISH_FLOW
 • ✅ Edge Intelligence Engine (Self-monitoring, Self-risk adjusting, Self-protecting)
 • ✅ Trailing Stop مع حماية مناطق السيولة والأوردر بلوك
-• ✅ Symbol Filter (أعلى 50 سيولة، حجم > 2M, سعر >= 0.00001)
+• ✅ Symbol Filter (أعلى 50 سيولة، حجم > MIN_VOLUME_24H, سعر >= 0.00001)
 • ✅ Market Volatility Filter (ATR% 15m > 6% مرفوض)
+• ✅ Slippage protection (MAX_SLIPPAGE_PCT = 0.3%)
+• ✅ Global consecutive loss circuit breaker (MAX_CONSECUTIVE_LOSSES = 3)
+• ✅ Liquidity filter configurable (MIN_VOLUME_24H)
+• ✅ تحسين التسجيل بوسوم ENTRY / FILL / TP / SL
 
 🧯 Daily Circuit
 • Enabled: {'ON' if CONFIG.get('ENABLE_DAILY_MAX_LOSS', True) else 'OFF'}
@@ -4938,6 +4995,7 @@ async def generate_performance_report() -> str:
 • Lock Failures: {sum(v['count'] for v in bot.lock_manager.failed_locks.values())}
 • Blacklisted Symbols (lock): {sum(1 for s in bot.lock_manager.failed_locks.keys() if bot.lock_manager.is_blacklisted(s))}
 • Consecutive Loss Blacklist: {len(bot.consecutive_loss_blacklist)}
+• Global Consecutive Losses: {STATS.get('global_consecutive_losses', 0)} / {CONFIG.get('MAX_CONSECUTIVE_LOSSES', 3)}
 """
         
         if metrics_summary:
@@ -5082,16 +5140,19 @@ async def main_loop(exchange):
         logger.info("  3. تحسين Order Flow Sampling (التشغيل دائماً لـ alignment≥2 إذا score>65)")
         logger.info("  4. RSI window (45-68)")
         logger.info("  5. Micro Structure Protection (مع شرط الحجم)")
-        logger.info("  6. Slippage Recheck بعد التنفيذ (إغلاق الصفقة إذا RR الفعلي < 2.5)")
+        logger.info("  6. Slippage Recheck بعد التنفيذ (RR ديناميكي حسب TP1_RR)")
         logger.info("  7. Consecutive Loss Guard (حظر الرمز 6 ساعات بعد خسارتين متتاليتين خلال 24 ساعة)")
         logger.info("  8. Dynamic Break‑Even (حسب النقاط)")
-        logger.info("  9. BTC Correlation Filter (corr < 0.2 مرفوض، مع تجاهل فشل API)")
+        logger.info("  9. BTC Correlation Filter (corr < 0.2 مرفوض، مع تجاهل فشل API وNaN)")
         logger.info(" 10. مكافأة إضافية لـ BELOW_VALUE + BULLISH_FLOW")
         logger.info(" 11. Edge Intelligence Engine (Self-monitoring, Self-risk adjusting, Self-protecting)")
         logger.info(" 12. Trailing Stop مع حماية مناطق السيولة والأوردر بلوك")
-        logger.info(" 13. Symbol Filter (أعلى 50 سيولة، حجم > 2M, سعر >= 0.00001)")
+        logger.info(" 13. Symbol Filter (أعلى 50 سيولة، حجم > MIN_VOLUME_24H, سعر >= 0.00001)")
         logger.info(" 14. Market Volatility Filter (ATR% 15m > 6% مرفوض)")
         logger.info(" 15. Quantum Score Rebalance (الأوزان الجديدة)")
+        logger.info(" 16. Slippage protection (MAX_SLIPPAGE_PCT)")
+        logger.info(" 17. Global consecutive loss circuit breaker (MAX_CONSECUTIVE_LOSSES)")
+        logger.info(" 18. تحسين التسجيل بوسوم ENTRY / FILL / TP / SL")
         logger.info("="*70)
         
         db_manager.init_database()
@@ -5151,16 +5212,19 @@ async def main_loop(exchange):
 • ✅ تحسين Order Flow Sampling (التشغيل دائماً لـ alignment≥2 إذا score>65)
 • ✅ RSI window (45-68)
 • ✅ Micro Structure Protection (مع شرط الحجم)
-• ✅ Slippage Recheck بعد التنفيذ (إغلاق الصفقة إذا RR الفعلي < 2.5)
+• ✅ Slippage Recheck بعد التنفيذ (RR ديناميكي حسب TP1_RR)
 • ✅ Consecutive Loss Guard (حظر الرمز 6 ساعات بعد خسارتين متتاليتين خلال 24 ساعة)
 • ✅ Dynamic Break‑Even (حسب النقاط)
-• ✅ BTC Correlation Filter (corr < 0.2 مرفوض، مع تجاهل فشل API)
+• ✅ BTC Correlation Filter (corr < 0.2 مرفوض، مع تجاهل فشل API وNaN)
 • ✅ مكافأة إضافية لـ BELOW_VALUE + BULLISH_FLOW
 • ✅ Edge Intelligence Engine (Self-monitoring, Self-risk adjusting, Self-protecting)
 • ✅ Trailing Stop مع حماية مناطق السيولة والأوردر بلوك
-• ✅ Symbol Filter (أعلى 50 سيولة، حجم > 2M, سعر >= 0.00001)
+• ✅ Symbol Filter (أعلى 50 سيولة، حجم > MIN_VOLUME_24H, سعر >= 0.00001)
 • ✅ Market Volatility Filter (ATR% 15m > 6% مرفوض)
 • ✅ Quantum Score Rebalance (الأوزان الجديدة)
+• ✅ Slippage protection (MAX_SLIPPAGE_PCT)
+• ✅ Global consecutive loss circuit breaker (MAX_CONSECUTIVE_LOSSES)
+• ✅ تحسين التسجيل بوسوم ENTRY / FILL / TP / SL
 
 🧯 Daily Circuit
 • Enabled: {'ON' if CONFIG.get('ENABLE_DAILY_MAX_LOSS', True) else 'OFF'}
@@ -5262,6 +5326,7 @@ async def main_loop(exchange):
                               f"lock_failures={sum(v['count'] for v in bot.lock_manager.failed_locks.values())}, "
                               f"blacklisted={sum(1 for s in bot.lock_manager.failed_locks.keys() if bot.lock_manager.is_blacklisted(s))}, "
                               f"loss_blacklist={len(bot.consecutive_loss_blacklist)}, "
+                              f"global_losses={STATS.get('global_consecutive_losses',0)}, "
                               f"edge_state={edge_state.system_state}, edge_mult={edge_state.risk_multiplier():.2f}"
                               )
                 
