@@ -2,7 +2,14 @@
 """
 QUANTUM FLOW TRADING BOT v1.8.6 - ULTIMATE INSTITUTIONAL EDITION
 WITH EDGE INTELLIGENCE ENGINE
+
 تم دمج جميع التحسينات الاحترافية المطلوبة:
+- تثبيت إصدار ccxt إلى 4.3.74
+- إضافة تبعيات aiohttp و aiodns
+- استبدال import ccxt.async_support باستيراد ccxt العادي ثم إسناده إلى async_support
+- ضمان تثبيت requirements.txt قبل تشغيل البوت (فحص في الكود)
+
+بالإضافة إلى التحسينات السابقة:
 - تعديل القيم الصارمة (trend strength 70, min score 68, spread 0.10, cooldown 1200)
 - تحسين Order Flow + Liquidity Grab (السماح بـ NEUTRAL عند وجود LG)
 - RSI window (45-68)
@@ -18,7 +25,7 @@ WITH EDGE INTELLIGENCE ENGINE
 - Cooldown 1200 ثانية
 - Max Symbol Scan 50
 - إصلاح NameError في detect_liquidity_grab
-- إصلاح BTC correlation filter لتجاهل أخطاب API
+- إصلاح BTC correlation filter لتجاهل أخطاء API
 - حماية حجم الصفقة من الانزلاق السعري بعد التنفيذ
 - تنظيف دوري للـ analysis_cache
 - إضافة حماية انزلاق RR (حسب TP1_RR)
@@ -27,13 +34,15 @@ WITH EDGE INTELLIGENCE ENGINE
 - إضافة قاطع الدارة العام MAX_CONSECUTIVE_LOSSES
 - إضافة MIN_VOLUME_24H كمتغير إعدادات
 - تحسين التسجيل بوسوم ENTRY / FILL / TP / SL
+
 جميع التغييرات مدمجة بدقة مع الحفاظ على الأنظمة الأساسية.
 """
 
 import asyncio
 import aiohttp
-from aiohttp import web
-import ccxt.async_support as ccxt
+import aiodns                     # إضافة aiodns كتبعية
+import ccxt                       # استيراد ccxt العادي أولاً
+ccxt = ccxt.async_support         # ثم إسناد الوحدة غير المتزامنة (يحافظ على الوظائف)
 import pandas as pd
 import ta
 import numpy as np
@@ -58,6 +67,15 @@ import copy
 from contextlib import contextmanager
 import random
 import math
+
+# التحقق من إصدار ccxt المطلوب
+REQUIRED_CCXT_VERSION = "4.3.74"
+try:
+    installed_version = ccxt.__version__
+    if installed_version != REQUIRED_CCXT_VERSION:
+        print(f"⚠️ إصدار ccxt المثبت ({installed_version}) يختلف عن المطلوب ({REQUIRED_CCXT_VERSION}). يُنصح بتثبيت الإصدار المحدد.")
+except Exception:
+    print("⚠️ تعذر التحقق من إصدار ccxt.")
 
 # ===================== EDGE ENGINE IMPORTS =====================
 from edge_engine import get_edge_engine, EdgeState
