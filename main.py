@@ -12,14 +12,14 @@ WITH EDGE INTELLIGENCE ENGINE
 بالإضافة إلى التحسينات السابقة:
 - تعديل القيم الصارمة (trend strength 70, min score 68, spread 0.10, cooldown 1200)
 - تحسين Order Flow + Liquidity Grab (السماح بـ NEUTRAL عند وجود LG)
-- RSI window (45-68)
+- RSI window (35-65)
 - Micro Structure Protection (مع شرط الحجم)
 - Quantum Score Rebalance (الأوزان الجديدة)
 - Dynamic Position Sizing (حسب النقاط)
 - Dynamic Break‑Even (حسب النقاط)
 - Trailing Stop مع حماية مناطق السيولة والأوردر بلوك
 - Symbol Filter (أعلى 50 سيولة، حجم > 2M, سعر >= 0.00001)
-- BTC Correlation Filter (corr < 0.2 مرفوض، مع تجاهل فشل API)
+- BTC Correlation Filter (corr < 0.1 مرفوض، مع تجاهل فشل API)
 - Market Volatility Filter (ATR% 15m > 6% مرفوض)
 - Spread Filter (0.10%)
 - Cooldown 1200 ثانية
@@ -27,7 +27,7 @@ WITH EDGE INTELLIGENCE ENGINE
 - إصلاح NameError في detect_liquidity_grab
 - إصلاح BTC correlation filter لتجاهل أخطاء API
 - حماية حجم الصفقة من الانزلاق السعري بعد التنفيذ
-- تنظيف دوري للـ analysis_cache
+- تنظيف دوري لـ correlation_cache
 - إضافة حماية انزلاق RR (حسب TP1_RR)
 - معالجة NaN في الارتباط وإرجاع None
 - إضافة MAX_SLIPPAGE_PCT
@@ -40,8 +40,9 @@ WITH EDGE INTELLIGENCE ENGINE
 
 import asyncio
 import aiohttp
-import aiodns                     # إضافة aiodns كتبعية
-import ccxt.async_support as ccxt   # استيراد ccxt غير المتزامن مباشرة (إصلاح خطأ Railway)
+from aiohttp import web                   # [FIX 1] إضافة استيراد web
+import aiodns
+import ccxt.async_support as ccxt
 import pandas as pd
 import ta
 import numpy as np
@@ -52,7 +53,7 @@ import os
 import sqlite3
 import hashlib
 import re
-import sys
+# import sys                               # [FIX 10] إزالة unused import
 import signal
 from datetime import datetime, timezone
 from dataclasses import dataclass, field, asdict
@@ -77,7 +78,7 @@ except Exception:
     print("⚠️ تعذر التحقق من إصدار ccxt.")
 
 # ===================== EDGE ENGINE IMPORTS =====================
-from edge_engine import get_edge_engine, EdgeState
+from edge_engine import get_edge_engine, EdgeState   # EdgeState مستخدم في التعليقات فقط، لكن نحتفظ به
 
 # ------------------------------------------------------------
 # التحقق من المكتبات الاختيارية
@@ -360,7 +361,7 @@ class TradingBot:
         }
         self.lock_manager = EnhancedLockManager()
         self.symbol_cooldown: Dict[str, float] = {}
-        self.analysis_cache: Dict[str, Dict[str, Any]] = {}
+        # self.analysis_cache: Dict[str, Dict[str, Any]] = {}   # [FIX 8] إزالة analysis_cache
         self.btc_trend: Optional[Dict] = None
         self.btc_last_check: float = 0
         self.consecutive_losses: Dict[str, List[float]] = defaultdict(list)  # timestamps of losses
@@ -962,6 +963,9 @@ CONFIG = {
 
     # [IMPROVEMENT] Liquidity filter configurable
     "MIN_VOLUME_24H": 2000000,
+
+    # [FIX 9] Add missing CONFIG flag for liquidity grab
+    "ENABLE_LIQUIDITY_GRAB": True,
 }
 
 # ===================== TELEGRAM ENV AUTO-LOAD =====================
@@ -995,6 +999,15 @@ def load_telegram_from_env():
     else:
         if CONFIG.get("AUTO_DISABLE_SILENT_WHEN_TG_OK", True):
             CONFIG["SILENT_MODE"] = False
+
+# [FIX 5] Load MEXC API Keys from environment variables
+def load_mexc_from_env():
+    key = os.getenv("MEXC_API_KEY") or os.getenv("MEXC_KEY")
+    secret = os.getenv("MEXC_API_SECRET") or os.getenv("MEXC_SECRET")
+    if key and not CONFIG.get("MEXC_API_KEY"):
+        CONFIG["MEXC_API_KEY"] = key.strip()
+    if secret and not CONFIG.get("MEXC_API_SECRET"):
+        CONFIG["MEXC_API_SECRET"] = secret.strip()
 
 # ===================== GLOBAL STATE =====================
 HTTP_SESSION: Optional[aiohttp.ClientSession] = None
@@ -1719,10 +1732,7 @@ def entry_quality_filter_5m(df_5m: pd.DataFrame, signal: 'QuantumSignal') -> Tup
         if abs(price_change_2_candles) > 0.02:
             return False, "momentum_too_fast"
         
-        if 'rsi' in df_5m.columns:
-            rsi = safe_float(last['rsi'])
-            if rsi > 70:
-                return False, "rsi_overbought"
+        # [FIX 11] Remove redundant RSI check (already done in signal generation)
         
         zone = _get_entry_reference_zone(signal)
         if zone and 'atr' in df_5m.columns:
@@ -3212,16 +3222,18 @@ def calculate_quantum_score(
     volume_profile: Optional[VolumeProfileData],
     liquidity_grab: Optional[LiquidityGrab],
     mtf_alignment: int,
-    df: pd.DataFrame
+    df: pd.DataFrame,
+    gates_passed: Optional[List[str]] = None   # [FIX 7] تمرير نتيجة البوابات بدلاً من إعادة حسابها
 ) -> Tuple[float, float, str]:
     
-    gates_ok, gates_list = evaluate_hard_gates(
-        market_structure, order_flow, volume_profile,
-        liquidity_grab, mtf_alignment, df
-    )
-    
-    if CONFIG["ENABLE_HARD_GATES"] and not gates_ok:
-        return 0.0, 0.0, "REJECT"
+    # إذا لم يتم تمرير نتيجة البوابات، نقوم بتقييمها (للتوافق مع الاستدعاءات السابقة)
+    if gates_passed is None:
+        gates_ok, gates_passed = evaluate_hard_gates(
+            market_structure, order_flow, volume_profile,
+            liquidity_grab, mtf_alignment, df
+        )
+        if CONFIG["ENABLE_HARD_GATES"] and not gates_ok:
+            return 0.0, 0.0, "REJECT"
     
     score = 0.0
     confidence_factors = []
@@ -3338,6 +3350,11 @@ def compute_sl_and_tp_from_structure(entry: float, market_structure: MarketStruc
         sl = entry - (atr * CONFIG["ATR_SL_MULT"])
         if sl >= entry or sl <= 0:
             sl = entry * 0.95
+    
+    # [IMPROVEMENT 1] Minimum stop loss distance (0.5% of entry price)
+    min_sl_distance = entry * 0.005
+    if (entry - sl) < min_sl_distance:
+        sl = entry - min_sl_distance
     
     max_sl_distance = entry * (CONFIG["MAX_SL_PCT"] / 100)
     hard_sl = entry - max_sl_distance
@@ -3621,10 +3638,10 @@ async def generate_quantum_signal(exchange, symbol: str) -> Optional[QuantumSign
         if not await check_btc_filter(exchange):
             return None
         
-        # [IMPROVEMENT] BTC Correlation Filter - skip if API fails or NaN
+        # [IMPROVEMENT 3] BTC Correlation Filter - skip if API fails or NaN, threshold now 0.10
         corr = await get_btc_correlation(exchange, symbol)
-        if corr is not None and corr < 0.2:
-            logger.info(f"[BTC Correlation] {symbol} correlation {corr:.2f} < 0.2 - skipping")
+        if corr is not None and corr < 0.10:   # <--- تعديل العتبة إلى 0.10
+            logger.info(f"[BTC Correlation] {symbol} correlation {corr:.2f} < 0.10 - skipping")
             return None
         
         mtf = await analyze_multi_timeframe(exchange, symbol)
@@ -3688,12 +3705,24 @@ async def generate_quantum_signal(exchange, symbol: str) -> Optional[QuantumSign
         if sl == 0:
             return None
         
-        # [IMPROVEMENT] RSI window: 45-68
+        # [IMPROVEMENT 2] RSI window: 35-65 (تعديل من 45-68 إلى 35-65)
         if 'rsi' in df_5m.columns:
             rsi_5m = df_5m['rsi'].iloc[-1]
-            if rsi_5m < 45 or rsi_5m > 68:
-                logger.info(f"[Momentum] {symbol} rejected: RSI 5m = {rsi_5m:.1f} outside 45-68")
+            if rsi_5m < 35 or rsi_5m > 65:   # <--- النطاق الجديد
+                logger.info(f"[Momentum] {symbol} rejected: RSI 5m = {rsi_5m:.1f} outside 35-65")
                 return None
+        
+        # [FIX 7] حساب البوابات مرة واحدة فقط
+        gates_ok, gates_list = evaluate_hard_gates(
+            structure_15m,
+            None,   # order_flow not yet computed
+            None,   # volume_profile not yet computed
+            liquidity_grab,
+            mtf['alignment'],
+            df_15m
+        )
+        if CONFIG["ENABLE_HARD_GATES"] and not gates_ok:
+            return None
         
         pre_qs, pre_conf, pre_class = calculate_quantum_score(
             structure_15m,
@@ -3701,7 +3730,8 @@ async def generate_quantum_signal(exchange, symbol: str) -> Optional[QuantumSign
             None,
             liquidity_grab,
             mtf['alignment'],
-            df_15m
+            df_15m,
+            gates_passed=gates_list   # تمرير قائمة البوابات بدلاً من إعادة الحساب
         )
         
         if pre_class == "QUANTUM_A+":
@@ -3729,13 +3759,15 @@ async def generate_quantum_signal(exchange, symbol: str) -> Optional[QuantumSign
         if CONFIG.get("ENABLE_VOLUME_PROFILE", False) and CONFIG.get("_VOLUME_PROFILE_SAMPLING_OK", True):
             volume_profile = analyze_volume_profile(df_15m, precheck_score=pre_qs)
         
+        # إعادة حساب النقاط مع order_flow و volume_profile
         quantum_score, confidence, signal_class = calculate_quantum_score(
             structure_15m,
             order_flow,
             volume_profile,
             liquidity_grab,
             mtf['alignment'],
-            df_15m
+            df_15m,
+            gates_passed=gates_list   # تمرير نفس قائمة البوابات
         )
         
         if quantum_score < CONFIG["MIN_QUANTUM_SCORE"]:
@@ -3786,10 +3818,7 @@ async def generate_quantum_signal(exchange, symbol: str) -> Optional[QuantumSign
             entry_5m=structure_5m.structure,
             risk_reward=risk_reward,
             win_probability=win_probability,
-            gates_passed=evaluate_hard_gates(
-                structure_15m, order_flow, volume_profile,
-                liquidity_grab, mtf['alignment'], df_15m
-            )[1]
+            gates_passed=gates_list   # حفظ البوابات التي تم اجتيازها
         )
     
     except Exception as e:
@@ -3816,6 +3845,11 @@ def format_quantum_signal(signal: QuantumSignal) -> str:
     
     live_badge = get_execution_mode_badge()
     
+    # [FIX 14] تصحيح عرض المخاطرة الحقيقية
+    account_size = CONFIG["ACCOUNT_SIZE_USDT"]
+    risk_amount = signal.position_size_usdt * (risk / signal.entry)   # المخاطرة بالدولار
+    risk_percent = (risk_amount / account_size) * 100
+    
     message = f"""
 {emoji} {escape_html(signal.signal_class)} - {escape_html(signal.mode)} - {escape_html(signal.symbol)}  ({live_badge})
 
@@ -3831,7 +3865,7 @@ def format_quantum_signal(signal: QuantumSignal) -> str:
 ━━━━━━━━━━━━━━━━
 • الحجم: ${signal.position_size_usdt:.2f}
 • % من الحساب: {signal.position_size_pct:.2f}%
-• المخاطرة: {signal.position_size_usdt / CONFIG['ACCOUNT_SIZE_USDT'] * 100:.2f}%
+• المخاطرة الحقيقية: {risk_percent:.2f}% (={risk_amount:.2f}$)
 
 📊 التحليل الكمي
 ━━━━━━━━━━━━━━━━
@@ -4089,6 +4123,9 @@ async def execute_live_entry_if_enabled(exchange, signal: QuantumSignal) -> Tupl
         )
         return False, None
     
+    # [FIX 4] نمط القفل - نأخذ نسخة ثم نحرر القفل أثناء API
+    # هنا لا يوجد قفل بعد، لكن في العمليات التالية سنطبق النمط.
+    
     entry_order = await place_limit_buy_entry(exchange, signal.symbol, signal.entry, amount_base)
     if not entry_order or not entry_order.get("id"):
         await send_telegram(
@@ -4153,7 +4190,30 @@ async def execute_live_entry_if_enabled(exchange, signal: QuantumSignal) -> Tupl
             await market_sell_safe(exchange, signal.symbol, fill_amount, max_retries=2)
             return False, None
     
-    # [FIX] Protect position sizing from slippage: compute actual risk amount and compare with intended
+    # [FIX 6] Recalculate position size using actual fill price
+    new_position_usdt, new_position_pct = await calculate_position_size(
+        fill_price, adj_sl, quantum_score=signal.quantum_score
+    )
+    # إذا كان الحجم الجديد أصغر بكثير، قد نقرر إلغاء الصفقة
+    if new_position_usdt < CONFIG["MIN_POSITION_SIZE_USDT"] * 0.5:
+        logger.warning(f"[Slippage] {signal.symbol} new position size {new_position_usdt:.2f} too small after recalc, closing")
+        await send_telegram(
+            f"⚠️ تم إغلاق الصفقة لأن حجم المركز الجديد صغير جداً بعد إعادة الحساب\n"
+            f"• الرمز: {escape_html(signal.symbol)}\n"
+            f"• الحجم الجديد: ${new_position_usdt:.2f}"
+        )
+        await market_sell_safe(exchange, signal.symbol, fill_amount, max_retries=2)
+        return False, None
+    
+    # تحديث حجم المركز بناءً على السعر الفعلي
+    adjusted_position_usdt = new_position_usdt
+    adjusted_amount_base = adjusted_position_usdt / fill_price
+    if adjusted_amount_base > fill_amount:
+        # لا يمكن أن نزيد الكمية بعد التنفيذ، نكتفي بالكمية المنفذة
+        adjusted_amount_base = fill_amount
+        adjusted_position_usdt = adjusted_amount_base * fill_price
+    
+    # [FIX 4] Protect position sizing from slippage: compute actual risk amount and compare with intended
     intended_position_base = signal.position_size_usdt / signal.entry
     intended_risk_amount = intended_position_base * (signal.entry - signal.sl)
     actual_risk_amount = fill_amount * (fill_price - adj_sl)
@@ -4184,7 +4244,7 @@ async def execute_live_entry_if_enabled(exchange, signal: QuantumSignal) -> Tupl
         entry_order_id=order_id,
         entry_filled=True,
         entry_fill_price=fill_price,
-        entry_fill_amount=fill_amount,
+        entry_fill_amount=adjusted_amount_base,   # الكمية المعدلة
         is_paper=False,
         execution_mode="LIVE",
         entry_assumed=False,
@@ -4195,7 +4255,7 @@ async def execute_live_entry_if_enabled(exchange, signal: QuantumSignal) -> Tupl
     )
     
     if CONFIG.get("LIVE_PLACE_SL_ORDER"):
-        sl_order = await place_stop_loss_order(exchange, signal.symbol, adj_sl, fill_amount)
+        sl_order = await place_stop_loss_order(exchange, signal.symbol, adj_sl, adjusted_amount_base)
         if sl_order:
             trade_state.sl_order_id = str(sl_order.get("id"))
             logger.info(f"[LIVE] SL order placed for {signal.symbol} at {adj_sl:.6f}, ID: {trade_state.sl_order_id}")
@@ -4360,14 +4420,17 @@ async def monitor_active_trades(exchange):
 async def _monitor_active_trades_internal(exchange):
     symbols = list(ACTIVE_TRADES.keys())
     
+    # [FIX 2] إنشاء قوائم متطابقة للرموز غير المدرجة في القائمة السوداء
     ticker_tasks = []
+    active_symbols = []
     for symbol in symbols:
         if not bot.lock_manager.is_blacklisted(symbol):
             ticker_tasks.append(fetch_ticker_with_lock(exchange, symbol))
+            active_symbols.append(symbol)
     
     ticker_results = await asyncio.gather(*ticker_tasks, return_exceptions=True)
     
-    for symbol, ticker_result in zip(symbols, ticker_results):
+    for symbol, ticker_result in zip(active_symbols, ticker_results):
         if isinstance(ticker_result, Exception):
             logger.error(f"[Monitor] Error fetching ticker for {symbol}: {ticker_result}")
             continue
@@ -4421,13 +4484,18 @@ async def _monitor_active_trades_internal(exchange):
                 else:
                     new_sl = trade.entry + (0.001 * trade.entry)
                 
+                # [FIX 4] نمط القفل: أخذ نسخة، تحديث خارج القفل، ثم إعادة القفل
+                async with bot.get_trade_lock(symbol):
+                    # نأخذ نسخة من البيانات المطلوبة
+                    current_version = trade._version
+                
                 updates = {
                     'current_sl': new_sl,
                     'be_moved': True,
-                    '_version': trade._version + 1
+                    '_version': current_version + 1
                 }
                 
-                if db_manager.update_trade_with_version(symbol, updates, trade._version):
+                if db_manager.update_trade_with_version(symbol, updates, current_version):
                     if await bot.get_trade_lock(symbol):
                         try:
                             if symbol in ACTIVE_TRADES:
@@ -4499,13 +4567,16 @@ async def _monitor_active_trades_internal(exchange):
             else:
                 new_sl = trade.entry + (0.001 * trade.entry)
             
+            async with bot.get_trade_lock(symbol):
+                current_version = trade._version
+            
             updates = {
                 'current_sl': new_sl,
                 'be_moved': True,
-                '_version': trade._version + 1
+                '_version': current_version + 1
             }
             
-            if db_manager.update_trade_with_version(symbol, updates, trade._version):
+            if db_manager.update_trade_with_version(symbol, updates, current_version):
                 if await bot.get_trade_lock(symbol):
                     try:
                         if symbol in ACTIVE_TRADES:
@@ -4599,6 +4670,9 @@ async def partial_exit(symbol: str, trade: TradeState, exit_price: float,
         live_sell_ok = True
         fill_price = exit_price
         
+        # [FIX 4] تحرير القفل قبل استدعاء API
+        bot.release_trade_lock(symbol)
+        
         if is_live_trading_enabled() and exchange and sell_amount_base > 0:
             sell_order = await market_sell_safe(exchange, symbol, sell_amount_base, max_retries=2)
             live_sell_ok = bool(sell_order)
@@ -4609,15 +4683,25 @@ async def partial_exit(symbol: str, trade: TradeState, exit_price: float,
                     fill_price = exit_price
             
             if not live_sell_ok:
-                if tp_level == "TP1":
-                    current_trade.tp1_order_done = False
-                elif tp_level == "TP2":
-                    current_trade.tp2_order_done = False
-                elif tp_level == "TP3":
-                    current_trade.tp3_order_done = False
+                # استعادة القفل لتحديث الحالة
+                if not await bot.get_trade_lock(symbol):
+                    logger.error(f"[partial_exit] Failed to reacquire lock for {symbol} after API failure")
+                    return
                 
-                current_trade.is_exiting = False
-                db_manager.save_trade(current_trade)
+                try:
+                    if symbol in ACTIVE_TRADES:
+                        if tp_level == "TP1":
+                            ACTIVE_TRADES[symbol].tp1_order_done = False
+                        elif tp_level == "TP2":
+                            ACTIVE_TRADES[symbol].tp2_order_done = False
+                        elif tp_level == "TP3":
+                            ACTIVE_TRADES[symbol].tp3_order_done = False
+                        
+                        ACTIVE_TRADES[symbol].is_exiting = False
+                        db_manager.save_trade(ACTIVE_TRADES[symbol])
+                finally:
+                    bot.release_trade_lock(symbol)
+                
                 asyncio.create_task(mark_trade_emergency(symbol, f"partial_sell_failed({tp_level})"))
                 return
             
@@ -4627,37 +4711,61 @@ async def partial_exit(symbol: str, trade: TradeState, exit_price: float,
                     await cancel_stop_loss_order(exchange, symbol, sl_order_id)
                     new_sl_order = await place_stop_loss_order(exchange, symbol, current_trade.current_sl, remaining_base)
                     if new_sl_order:
-                        current_trade.sl_order_id = str(new_sl_order.get("id"))
+                        new_sl_order_id = str(new_sl_order.get("id"))
                     else:
                         logger.warning(f"[partial_exit] Failed to place new SL for {symbol}")
+                        new_sl_order_id = ""
         
-        risk = trade.entry - trade.original_sl
-        actual_r_multiple = (fill_price - trade.entry) / risk if risk > 0 else 0
-        exit_r = actual_r_multiple * exit_pct
+        # إعادة القفل لتحديث الحالة
+        if not await bot.get_trade_lock(symbol):
+            logger.error(f"[partial_exit] Failed to reacquire lock for {symbol} after API")
+            return
         
-        if current_trade._version != current_version:
-            logger.warning(f"[partial_exit] Version mismatch for {symbol}. Expected {current_version}, got {current_trade._version}. Proceeding.")
+        try:
+            if symbol not in ACTIVE_TRADES:
+                return
+            
+            current_trade = ACTIVE_TRADES[symbol]  # إعادة جلب الكائن المحدث
+            
+            risk = trade.entry - trade.original_sl
+            actual_r_multiple = (fill_price - trade.entry) / risk if risk > 0 else 0
+            exit_r = actual_r_multiple * exit_pct
+            
+            if current_trade._version != current_version:
+                logger.warning(f"[partial_exit] Version mismatch for {symbol}. Expected {current_version}, got {current_trade._version}. Proceeding.")
+            
+            current_trade.remaining_position -= exit_pct
+            current_trade.total_realized_r += exit_r
+            
+            if tp_level == "TP1":
+                current_trade.tp1_hit = True
+                logger.info(f"[TP1] {symbol} hit at {fill_price}")
+            elif tp_level == "TP2":
+                current_trade.tp2_hit = True
+                logger.info(f"[TP2] {symbol} hit at {fill_price}")
+            elif tp_level == "TP3":
+                current_trade.tp3_hit = True
+                logger.info(f"[TP3] {symbol} hit at {fill_price}")
+            
+            current_trade._version += 1
+            current_trade.is_exiting = False
+            
+            if is_live_trading_enabled() and exchange and new_sl_order_id:
+                current_trade.sl_order_id = new_sl_order_id
+            
+            db_manager.save_trade(current_trade)
         
-        current_trade.remaining_position -= exit_pct
-        current_trade.total_realized_r += exit_r
-        
-        if tp_level == "TP1":
-            current_trade.tp1_hit = True
-            logger.info(f"[TP1] {symbol} hit at {fill_price}")
-        elif tp_level == "TP2":
-            current_trade.tp2_hit = True
-            logger.info(f"[TP2] {symbol} hit at {fill_price}")
-        elif tp_level == "TP3":
-            current_trade.tp3_hit = True
-            logger.info(f"[TP3] {symbol} hit at {fill_price}")
-        
-        current_trade._version += 1
-        current_trade.is_exiting = False
-        
-        db_manager.save_trade(current_trade)
-        
-    finally:
-        bot.release_trade_lock(symbol)
+        finally:
+            bot.release_trade_lock(symbol)
+    
+    except Exception as e:
+        logger.error(f"[partial_exit] Unhandled error for {symbol}: {e}")
+        # محاولة تحرير القفل إذا كان محتجزاً
+        try:
+            bot.release_trade_lock(symbol)
+        except:
+            pass
+        return
     
     if tp_level == "TP1":
         STATS["tp1_hits"] += 1
@@ -4743,6 +4851,7 @@ async def close_trade_full(symbol: str, exit_price: float, exit_type: str, excha
     fill_price = exit_price
     if is_live_trading_enabled() and exchange is not None and remaining > 0.01 and exit_type in ("SL", "ALL_TPS"):
         remaining_base = fill_amount * remaining
+        # [FIX 4] لا حاجة لقفل هنا، سنقوم بالبيع ثم نستعيد القفل للتحديث
         sell_order = await market_sell_safe(exchange, symbol, remaining_base, max_retries=3)
         live_sell_ok = bool(sell_order)
         
@@ -4879,12 +4988,12 @@ async def generate_performance_report() -> str:
 • ✅ تعديلات القيم الصارمة (trend strength 70, min score 68, spread 0.10, cooldown 1200)
 • ✅ تفعيل أمر SL على المنصة افتراضياً
 • ✅ تحسين Order Flow Sampling (التشغيل دائماً لـ alignment≥2 إذا score>65)
-• ✅ RSI window (45-68)
+• ✅ RSI window (35-65)
 • ✅ Micro Structure Protection (مع شرط الحجم)
 • ✅ Slippage Recheck بعد التنفيذ (RR ديناميكي حسب TP1_RR)
 • ✅ Consecutive Loss Guard (حظر الرمز 6 ساعات بعد خسارتين متتاليتين خلال 24 ساعة)
 • ✅ Dynamic Break‑Even (حسب النقاط)
-• ✅ BTC Correlation Filter (corr < 0.2 مرفوض، مع تجاهل فشل API وNaN)
+• ✅ BTC Correlation Filter (corr < 0.1 مرفوض، مع تجاهل فشل API وNaN)
 • ✅ مكافأة إضافية لـ BELOW_VALUE + BULLISH_FLOW
 • ✅ Edge Intelligence Engine (Self-monitoring, Self-risk adjusting, Self-protecting)
 • ✅ Trailing Stop مع حماية مناطق السيولة والأوردر بلوك
@@ -4907,9 +5016,9 @@ async def generate_performance_report() -> str:
 • Enabled: {'ON' if is_live_trading_enabled() else 'OFF'}
 
 📊 Metrics
-• Signal Generation: {metrics.get_percentiles('signal_generation').get('p50', 0):.3f}s (p95)
-• MTF Analysis: {metrics.get_percentiles('mtf_analysis').get('p50', 0):.3f}s (p95)
-• Order Flow: {metrics.get_percentiles('order_flow_analysis').get('p50', 0):.3f}s (p95)
+• Signal Generation: p50={metrics.get_percentiles('signal_generation').get('p50', 0):.3f}s, p95={metrics.get_percentiles('signal_generation').get('p95', 0):.3f}s
+• MTF Analysis: p50={metrics.get_percentiles('mtf_analysis').get('p50', 0):.3f}s, p95={metrics.get_percentiles('mtf_analysis').get('p95', 0):.3f}s
+• Order Flow: p50={metrics.get_percentiles('order_flow_analysis').get('p50', 0):.3f}s, p95={metrics.get_percentiles('order_flow_analysis').get('p95', 0):.3f}s
 
 {"🔄 " + str(len(ACTIVE_TRADES)) + " صفقة تم استردادها" if ACTIVE_TRADES else ""}
 
@@ -5042,9 +5151,13 @@ async def toggle_computational_features():
     if loop_count % 7 == 0:
         await cache.smart_cache_cleanup()
     
-    # [FIX] Clean up analysis_cache periodically to prevent memory growth
-    if loop_count % 10 == 0:
-        bot.analysis_cache.clear()
+    # [FIX 15] Periodically clean correlation_cache
+    if loop_count % 100 == 0:
+        now = time.time()
+        bot.correlation_cache = {
+            k: v for k, v in bot.correlation_cache.items()
+            if now - v[1] < 3600   # الاحتفاظ بالمدخلات الأقل من ساعة
+        }
 
 # ===================== HEALTH CHECK ENDPOINT =====================
 async def health_check_handler(request):
@@ -5155,12 +5268,12 @@ async def main_loop(exchange):
         logger.info("  1. تعديلات القيم الصارمة (trend strength 70, min score 68, spread 0.10, cooldown 1200)")
         logger.info("  2. تفعيل أمر SL على المنصة افتراضياً")
         logger.info("  3. تحسين Order Flow Sampling (التشغيل دائماً لـ alignment≥2 إذا score>65)")
-        logger.info("  4. RSI window (45-68)")
+        logger.info("  4. RSI window (35-65)")
         logger.info("  5. Micro Structure Protection (مع شرط الحجم)")
         logger.info("  6. Slippage Recheck بعد التنفيذ (RR ديناميكي حسب TP1_RR)")
         logger.info("  7. Consecutive Loss Guard (حظر الرمز 6 ساعات بعد خسارتين متتاليتين خلال 24 ساعة)")
         logger.info("  8. Dynamic Break‑Even (حسب النقاط)")
-        logger.info("  9. BTC Correlation Filter (corr < 0.2 مرفوض، مع تجاهل فشل API وNaN)")
+        logger.info("  9. BTC Correlation Filter (corr < 0.1 مرفوض، مع تجاهل فشل API وNaN)")
         logger.info(" 10. مكافأة إضافية لـ BELOW_VALUE + BULLISH_FLOW")
         logger.info(" 11. Edge Intelligence Engine (Self-monitoring, Self-risk adjusting, Self-protecting)")
         logger.info(" 12. Trailing Stop مع حماية مناطق السيولة والأوردر بلوك")
@@ -5227,12 +5340,12 @@ async def main_loop(exchange):
 • ✅ تعديلات القيم الصارمة (trend strength 70, min score 68, spread 0.10, cooldown 1200)
 • ✅ تفعيل أمر SL على المنصة افتراضياً
 • ✅ تحسين Order Flow Sampling (التشغيل دائماً لـ alignment≥2 إذا score>65)
-• ✅ RSI window (45-68)
+• ✅ RSI window (35-65)
 • ✅ Micro Structure Protection (مع شرط الحجم)
 • ✅ Slippage Recheck بعد التنفيذ (RR ديناميكي حسب TP1_RR)
 • ✅ Consecutive Loss Guard (حظر الرمز 6 ساعات بعد خسارتين متتاليتين خلال 24 ساعة)
 • ✅ Dynamic Break‑Even (حسب النقاط)
-• ✅ BTC Correlation Filter (corr < 0.2 مرفوض، مع تجاهل فشل API وNaN)
+• ✅ BTC Correlation Filter (corr < 0.1 مرفوض، مع تجاهل فشل API وNaN)
 • ✅ مكافأة إضافية لـ BELOW_VALUE + BULLISH_FLOW
 • ✅ Edge Intelligence Engine (Self-monitoring, Self-risk adjusting, Self-protecting)
 • ✅ Trailing Stop مع حماية مناطق السيولة والأوردر بلوك
@@ -5331,7 +5444,7 @@ async def main_loop(exchange):
                 sleep_time = max(5, 15 - loop_time)
                 
                 if CONFIG["DEBUG_MODE"] or loop_count % 10 == 0:
-                    edge_state = await get_edge_engine()
+                    edge_engine = await get_edge_engine()   # [FIX 12] استخدام اسم edge_engine
                     logger.info(f"[دورة {loop_count}] الوقت: {loop_time:.1f}ث، الانتظار: {sleep_time:.1f}ث، "
                               f"الإشارات: {STATS['signals_generated']}, النشطة: {len(ACTIVE_TRADES)}, "
                               f"paper_opened={STATS.get('paper_trades_opened',0)}, cooldown={CONFIG.get('SYMBOL_COOLDOWN_SEC')}, "
@@ -5344,7 +5457,7 @@ async def main_loop(exchange):
                               f"blacklisted={sum(1 for s in bot.lock_manager.failed_locks.keys() if bot.lock_manager.is_blacklisted(s))}, "
                               f"loss_blacklist={len(bot.consecutive_loss_blacklist)}, "
                               f"global_losses={STATS.get('global_consecutive_losses',0)}, "
-                              f"edge_state={edge_state.system_state}, edge_mult={edge_state.risk_multiplier():.2f}"
+                              f"edge_state={edge_engine.system_state}, edge_mult={edge_engine.risk_multiplier():.2f}"
                               )
                 
                 await asyncio.sleep(sleep_time)
@@ -5544,6 +5657,7 @@ async def async_main():
             logger.info("ℹ️ TA-Lib غير متوفر - سيتم استخدام ta (عادي)")
         
         load_telegram_from_env()
+        load_mexc_from_env()   # [FIX 5] تحميل مفاتيح MEXC من البيئة
         
         if CONFIG["ENABLE_DB_PERSISTENCE"]:
             logger.info("✅ ثبات قاعدة البيانات مفعّل")
@@ -5580,6 +5694,14 @@ async def async_main():
         edge_engine = await get_edge_engine()
         logger.info("[EdgeEngine] Initialized with state: %s", edge_engine.system_state)
         # ================================
+        
+        # [FIX 3] إضافة معالج الإشارات للإيقاف التدريجي
+        def _handle_signal(sig, frame):
+            logger.warning(f"[Signal] Received {sig}, initiating graceful shutdown...")
+            shutdown_manager.should_stop = True
+        
+        signal.signal(signal.SIGTERM, _handle_signal)
+        signal.signal(signal.SIGINT, _handle_signal)
         
         await main_loop(exchange)
         
