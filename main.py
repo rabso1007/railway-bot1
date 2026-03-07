@@ -6,7 +6,7 @@ WITH EDGE INTELLIGENCE ENGINE
 تم دمج جميع التحسينات الاحترافية المطلوبة:
 - تثبيت إصدار ccxt إلى 4.3.74
 - إضافة تبعيات aiohttp و aiodns
-- استبدال import ccxt.async_support باستيراد ccxt العادي ثم إسناده إلى async_support
+- استيراد ccxt.async_support مباشرة (إصلاح خطأ Railway)
 - ضمان تثبيت requirements.txt قبل تشغيل البوت (فحص في الكود)
 
 بالإضافة إلى التحسينات السابقة:
@@ -41,8 +41,7 @@ WITH EDGE INTELLIGENCE ENGINE
 import asyncio
 import aiohttp
 import aiodns                     # إضافة aiodns كتبعية
-import ccxt                       # استيراد ccxt العادي أولاً
-ccxt = ccxt.async_support         # ثم إسناد الوحدة غير المتزامنة (يحافظ على الوظائف)
+import ccxt.async_support as ccxt   # استيراد ccxt غير المتزامن مباشرة (إصلاح خطأ Railway)
 import pandas as pd
 import ta
 import numpy as np
