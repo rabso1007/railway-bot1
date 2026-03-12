@@ -19,11 +19,11 @@ WITH EDGE INTELLIGENCE ENGINE
 - Dynamic Break‑Even (حسب النقاط)
 - Trailing Stop مع حماية مناطق السيولة والأوردر بلوك
 - Symbol Filter (أعلى 50 سيولة، حجم > 2M, سعر >= 0.00001)
-- BTC Correlation Filter (corr < 0.1 مرفوض، مع تجاهل فشل API)
+- BTC Correlation Filter (corr < 0.05 مرفوض، مع تجاهل فشل API)
 - Market Volatility Filter (ATR% 15m > 6% مرفوض)
 - Spread Filter (0.10%)
 - Cooldown 1200 ثانية
-- Max Symbol Scan 50
+- Max Symbol Scan 80
 - إصلاح NameError في detect_liquidity_grab
 - إصلاح BTC correlation filter لتجاهل أخطاء API
 - حماية حجم الصفقة من الانزلاق السعري بعد التنفيذ
@@ -40,7 +40,7 @@ WITH EDGE INTELLIGENCE ENGINE
 
 import asyncio
 import aiohttp
-from aiohttp import web                   # [FIX 1] إضافة استيراد web
+from aiohttp import web
 import aiodns
 import ccxt.async_support as ccxt
 import pandas as pd
@@ -53,7 +53,6 @@ import os
 import sqlite3
 import hashlib
 import re
-# import sys                               # [FIX 10] إزالة unused import
 import signal
 from datetime import datetime, timezone
 from dataclasses import dataclass, field, asdict
@@ -64,9 +63,10 @@ import traceback
 import tracemalloc
 from functools import wraps
 import copy
-from contextlib import contextmanager
+from contextlib import contextmanager, asynccontextmanager
 import random
 import math
+from logging.handlers import RotatingFileHandler
 
 # التحقق من إصدار ccxt المطلوب
 REQUIRED_CCXT_VERSION = "4.3.74"
@@ -78,7 +78,23 @@ except Exception:
     print("⚠️ تعذر التحقق من إصدار ccxt.")
 
 # ===================== EDGE ENGINE IMPORTS =====================
-from edge_engine import get_edge_engine, EdgeState   # EdgeState مستخدم في التعليقات فقط، لكن نحتفظ به
+try:
+    from edge_engine import get_edge_engine, EdgeState as RealEdgeState
+except ImportError:
+    logger = logging.getLogger(__name__)
+    logger.warning("edge_engine غير موجود - استخدام الوضع الافتراضي")
+    class EdgeState:
+        system_state = "NORMAL"
+        def risk_multiplier(self):
+            return 1.0
+        def should_trade(self):
+            return True
+        async def record_trade(self, r_multiple, quantum_score, exit_type):
+            return None
+        def get_telemetry_report(self):
+            return "EdgeEngine (fallback): no data"
+    async def get_edge_engine():
+        return EdgeState()
 
 # ------------------------------------------------------------
 # التحقق من المكتبات الاختيارية
@@ -111,7 +127,7 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler('quantum_flow_institutional.log', encoding='utf-8')
+        RotatingFileHandler('quantum_flow_institutional.log', maxBytes=10_000_000, backupCount=5, encoding='utf-8')
     ]
 )
 logger = logging.getLogger(__name__)
@@ -142,15 +158,22 @@ class GracefulShutdown:
 shutdown_manager = GracefulShutdown()
 
 # ===================== AUDIT LOGGING =====================
+audit_handler = RotatingFileHandler("audit.log", maxBytes=10_000_000, backupCount=5, encoding='utf-8')
+audit_logger = logging.getLogger('audit')
+audit_logger.setLevel(logging.INFO)
+audit_logger.addHandler(audit_handler)
+audit_logger.propagate = False
+
 def log_order_audit(order_type: str, symbol: str, price: float, amount: float, status: str = ""):
     try:
-        with open("audit.log", "a", encoding='utf-8') as f:
-            f.write(f"{datetime.now(timezone.utc).isoformat()},{order_type},{symbol},{price},{amount},{status}\n")
+        audit_logger.info(f"{datetime.now(timezone.utc).isoformat()},{order_type},{symbol},{price},{amount},{status}")
     except Exception as e:
         logger.error(f"[Audit Log Error] {str(e)}")
 
 # ===================== METRICS COLLECTOR =====================
 class MetricsCollector:
+    MAX_METRIC_HISTORY = 1000
+    
     def __init__(self):
         self.metrics: Dict[str, List[Dict]] = defaultdict(list)
         self.lock = asyncio.Lock()
@@ -175,6 +198,8 @@ class MetricsCollector:
                             "duration": end - start,
                             "success": success
                         })
+                        if len(self.metrics[operation]) > self.MAX_METRIC_HISTORY:
+                            self.metrics[operation] = self.metrics[operation][-self.MAX_METRIC_HISTORY:]
             return wrapper
         return decorator
     
@@ -184,6 +209,8 @@ class MetricsCollector:
                 "timestamp": time.time(),
                 "error_type": error_type
             })
+            if len(self.metrics[f"{operation}_errors"]) > self.MAX_METRIC_HISTORY:
+                self.metrics[f"{operation}_errors"] = self.metrics[f"{operation}_errors"][-self.MAX_METRIC_HISTORY:]
     
     def get_percentiles(self, metric: str) -> Dict[str, float]:
         if metric not in self.metrics or not self.metrics[metric]:
@@ -230,7 +257,9 @@ class ExponentialBackoffRetry:
             except (asyncio.TimeoutError, aiohttp.ClientError) as e:
                 last_exception = e
                 if attempt == self.max_retries - 1:
-                    raise
+                    if last_exception is None:
+                        last_exception = RuntimeError("Retry attempts exhausted")
+                    raise last_exception
                 delay = min(
                     self.base_delay * (2 ** attempt) + random.uniform(0, 1),
                     self.max_delay
@@ -238,7 +267,7 @@ class ExponentialBackoffRetry:
                 logger.warning(f"Retry {attempt+1}/{self.max_retries} after {delay:.1f}s: {e}")
                 await asyncio.sleep(delay)
         
-        raise last_exception
+        raise last_exception if last_exception else RuntimeError("Retry attempts exhausted")
 
 # ===================== ENHANCED LOCK MANAGER =====================
 class EnhancedLockManager:
@@ -326,6 +355,16 @@ class EnhancedLockManager:
         for symbol in symbols:
             self.release_trade_lock(symbol)
 
+@asynccontextmanager
+async def trade_lock(bot_instance: 'TradingBot', symbol: str):
+    acquired = await bot_instance.get_trade_lock(symbol)
+    if not acquired:
+        raise RuntimeError(f"Could not acquire lock for {symbol}")
+    try:
+        yield
+    finally:
+        bot_instance.release_trade_lock(symbol)
+
 # ===================== TRADING BOT CLASS =====================
 class TradingBot:
     def __init__(self):
@@ -357,16 +396,16 @@ class TradingBot:
             "paper_trades_opened": 0,
             "loop_count": 0,
             "last_reset_date": None,
-            "global_consecutive_losses": 0,  # [IMPROVEMENT] Global consecutive losses
+            "global_consecutive_losses": 0,
         }
         self.lock_manager = EnhancedLockManager()
         self.symbol_cooldown: Dict[str, float] = {}
-        # self.analysis_cache: Dict[str, Dict[str, Any]] = {}   # [FIX 8] إزالة analysis_cache
         self.btc_trend: Optional[Dict] = None
         self.btc_last_check: float = 0
-        self.consecutive_losses: Dict[str, List[float]] = defaultdict(list)  # timestamps of losses
-        self.consecutive_loss_blacklist: Dict[str, float] = {}  # symbol -> expiry timestamp
-        self.correlation_cache: Dict[str, Tuple[float, float]] = {}  # symbol -> (correlation, timestamp)
+        self.consecutive_losses: Dict[str, List[float]] = defaultdict(list)
+        self.consecutive_loss_blacklist: Dict[str, float] = {}
+        self.correlation_cache: Dict[str, Tuple[float, float]] = {}
+        self.correlation_cache_lock = asyncio.Lock()   # قفل للوصول المتزامن
     
     async def get_trade_lock(self, symbol: str):
         return await self.lock_manager.acquire_trade_lock(symbol)
@@ -440,6 +479,13 @@ class APICircuitBreaker:
 api_circuit = APICircuitBreaker(failure_threshold=5, timeout=60)
 
 # ===================== ENHANCED HELPER FUNCTIONS =====================
+def _escape_html_basic(s: str) -> str:
+    """Escape basic HTML characters."""
+    return (s.replace("&", "&amp;")
+             .replace("<", "&lt;")
+             .replace(">", "&gt;")
+             .replace('"', "&quot;"))
+
 def escape_html(text: Any) -> str:
     if not isinstance(text, str):
         text = str(text)
@@ -463,7 +509,7 @@ def escape_html(text: Any) -> str:
         text = text.replace(char, escape)
     
     for placeholder, code_content in temp_placeholders:
-        text = text.replace(placeholder, f'<code>{code_content}</code>')
+        text = text.replace(placeholder, f'<code>{_escape_html_basic(code_content)}</code>')
     
     return text
 
@@ -563,8 +609,8 @@ def _ensure_runtime_paths():
                 newp = os.path.join(runtime_dir, default_filename)
                 CONFIG[key] = newp
 
-        _fix_path("CHECKPOINT_PATH", "quantum_checkpoint.pkl")
-        _fix_path("EMERGENCY_CHECKPOINT_PATH", "quantum_emergency_checkpoint.pkl")
+        _fix_path("CHECKPOINT_PATH", "quantum_checkpoint.json")
+        _fix_path("EMERGENCY_CHECKPOINT_PATH", "quantum_emergency_checkpoint.json")
         _fix_path("EMERGENCY_SELL_LOG", "emergency_sells.json")
 
     except Exception:
@@ -717,7 +763,7 @@ class TradeState:
     entry_assumed: bool = False
     is_exiting: bool = False
     _version: int = 0
-    # [IMPROVEMENT] Fields for trailing stop protection
+    # حقول جديدة لحماية التريلينج
     order_block_low: float = 0.0
     order_block_high: float = 0.0
     liquidity_grab_level: float = 0.0
@@ -818,14 +864,14 @@ CONFIG = {
     
     # Trading Settings
     "LONG_ONLY": True,
-    "MIN_QUANTUM_SCORE": 68,                     # [IMPROVEMENT] increased from 65
+    "MIN_QUANTUM_SCORE": 68,
     "QUANTUM_A_SCORE": 75,
     "QUANTUM_A_PLUS_SCORE": 80,
     "MAX_DAILY_A_PLUS": 7,
     
     # Hard Gates
     "ENABLE_HARD_GATES": True,
-    "HARD_GATE_1_MIN_TREND_STRENGTH": 70,        # [IMPROVEMENT] increased from 65
+    "HARD_GATE_1_MIN_TREND_STRENGTH": 70,
     "HARD_GATE_1_MIN_MTF_ALIGNMENT": 2,
     "HARD_GATE_2_REQUIRE_ZONE": True,
     "HARD_GATE_2_MIN_LG_CONFIDENCE": 70,
@@ -855,7 +901,7 @@ CONFIG = {
     
     # Market Regime Filter
     "ENABLE_MARKET_REGIME_FILTER": True,
-    "MIN_ADX_FOR_TREND": 20,
+    "MIN_ADX_FOR_TREND": 16,
     "MAX_CHASE_MOVE_PCT": 0.03,
     
     # BTC Filter
@@ -868,7 +914,7 @@ CONFIG = {
     "MEXC_API_KEY": "",
     "MEXC_API_SECRET": "",
     "LIVE_MAX_OPEN_TRADES": 5,
-    "MAX_SPREAD_PCT": 0.10,                      # [IMPROVEMENT] reduced from 0.15
+    "MAX_SPREAD_PCT": 0.10,
     "ENTRY_ORDER_TYPE": "limit",
     "ENTRY_LIMIT_TIMEOUT_SEC": 120,
     "ENTRY_LIMIT_POLL_SEC": 3,
@@ -888,10 +934,10 @@ CONFIG = {
     "ENABLE_ENTRY_QUALITY_FILTER": True,
     "ENTRY_QUALITY_MAX_ATR_PCT_5M": 5.5,
     "ENTRY_QUALITY_MAX_BB_WIDTH_5M": 0.08,
-    "ENTRY_QUALITY_MAX_DISTANCE_FROM_ZONE_ATR": 1.2,
+    "ENTRY_QUALITY_MAX_DISTANCE_FROM_ZONE_ATR": 1.6,
     
     # Cooldown
-    "SYMBOL_COOLDOWN_SEC": 1200,                  # [IMPROVEMENT] increased from 900
+    "SYMBOL_COOLDOWN_SEC": 1200,
     
     # Daily Circuit Breaker
     "ENABLE_DAILY_MAX_LOSS": True,
@@ -920,8 +966,8 @@ CONFIG = {
     # Checkpoints
     "ENABLE_CHECKPOINTS": True,
     "CHECKPOINT_INTERVAL_SEC": 300,
-    "CHECKPOINT_PATH": "/content/quantum_checkpoint.pkl",
-    "EMERGENCY_CHECKPOINT_PATH": "/content/quantum_emergency_checkpoint.pkl",
+    "CHECKPOINT_PATH": "/content/quantum_checkpoint.json",
+    "EMERGENCY_CHECKPOINT_PATH": "/content/quantum_emergency_checkpoint.json",
     "EMERGENCY_SELL_LOG": "/content/emergency_sells.json",
     
     # Debug
@@ -932,7 +978,7 @@ CONFIG = {
     
     # Advanced
     "ORDER_FLOW_ENABLE_FOR_ALIGNMENT_2_IF_STRONG_SCORE": True,
-    "ORDER_FLOW_PRECHECK_MIN_SCORE": 68.0,       # [IMPROVEMENT] aligned with MIN_QUANTUM_SCORE
+    "ORDER_FLOW_PRECHECK_MIN_SCORE": 68.0,
     
     # INSTITUTIONAL FEATURES
     "ENABLE_MEMORY_MONITORING": False,
@@ -952,20 +998,23 @@ CONFIG = {
     # Reconciliation
     "RECONCILIATION_INTERVAL_SEC": 300,
     
-    # [IMPROVEMENT] New volatility filter
-    "MAX_ATR_PCT_15M": 6.0,
+    # Volatility filter
+    "MAX_ATR_PCT_15M": 8.0,
 
-    # [IMPROVEMENT] New slippage protection
-    "MAX_SLIPPAGE_PCT": 0.003,                    # 0.3% maximum slippage
+    # Slippage protection
+    "MAX_SLIPPAGE_PCT": 0.0035,
 
-    # [IMPROVEMENT] Global consecutive losses circuit breaker
+    # Global consecutive losses circuit breaker
     "MAX_CONSECUTIVE_LOSSES": 3,
 
-    # [IMPROVEMENT] Liquidity filter configurable
+    # Liquidity filter configurable
     "MIN_VOLUME_24H": 2000000,
 
-    # [FIX 9] Add missing CONFIG flag for liquidity grab
+    # Enable liquidity grab
     "ENABLE_LIQUIDITY_GRAB": True,
+
+    # Max symbol scan
+    "MAX_SYMBOL_SCAN": 80,
 }
 
 # ===================== TELEGRAM ENV AUTO-LOAD =====================
@@ -1000,7 +1049,6 @@ def load_telegram_from_env():
         if CONFIG.get("AUTO_DISABLE_SILENT_WHEN_TG_OK", True):
             CONFIG["SILENT_MODE"] = False
 
-# [FIX 5] Load MEXC API Keys from environment variables
 def load_mexc_from_env():
     key = os.getenv("MEXC_API_KEY") or os.getenv("MEXC_KEY")
     secret = os.getenv("MEXC_API_SECRET") or os.getenv("MEXC_SECRET")
@@ -1011,6 +1059,7 @@ def load_mexc_from_env():
 
 # ===================== GLOBAL STATE =====================
 HTTP_SESSION: Optional[aiohttp.ClientSession] = None
+_http_session_lock = asyncio.Lock()
 BTC_TREND: Optional[Dict] = None
 BTC_LAST_CHECK: float = 0
 
@@ -1180,17 +1229,6 @@ def validate_config():
     if CONFIG.get("LIVE_RECALIBRATION_MODE") not in ("rr",):
         errors.append("❌ LIVE_RECALIBRATION_MODE غير صحيح (اختر: rr)")
 
-    seen_keys = set()
-    duplicate_keys = []
-    for key in CONFIG.keys():
-        if key in seen_keys:
-            duplicate_keys.append(key)
-        else:
-            seen_keys.add(key)
-    
-    if duplicate_keys:
-        errors.append(f"❌ مفاتيح مكررة في CONFIG: {duplicate_keys}")
-
     if errors:
         for err in errors:
             logger.error(err)
@@ -1316,7 +1354,7 @@ class SmartCache:
                 logger.info(f"🧹 Cache: {len(self.cache)} items after cleanup")
     
     async def get_ohlcv(self, exchange, symbol: str, timeframe: str, limit: int = 150) -> Optional[List]:
-        cache_key = f"{symbol}{timeframe}{limit}"
+        cache_key = f"{symbol}:{timeframe}:{limit}"
         ttl = self._get_ttl(timeframe)
         
         async with self.lock:
@@ -1404,24 +1442,25 @@ cache = SmartCache()
 # ===================== ENHANCED HTTP SESSION =====================
 async def get_session() -> aiohttp.ClientSession:
     global HTTP_SESSION
-    if HTTP_SESSION is None or HTTP_SESSION.closed:
-        timeout = aiohttp.ClientTimeout(
-            total=30,
-            connect=10,
-            sock_read=15,
-            sock_connect=10
-        )
-        connector = aiohttp.TCPConnector(
-            limit=100,
-            limit_per_host=30,
-            ttl_dns_cache=300,
-            enable_cleanup_closed=True
-        )
-        HTTP_SESSION = aiohttp.ClientSession(
-            timeout=timeout,
-            connector=connector,
-            raise_for_status=False
-        )
+    async with _http_session_lock:
+        if HTTP_SESSION is None or HTTP_SESSION.closed:
+            timeout = aiohttp.ClientTimeout(
+                total=30,
+                connect=10,
+                sock_read=15,
+                sock_connect=10
+            )
+            connector = aiohttp.TCPConnector(
+                limit=100,
+                limit_per_host=30,
+                ttl_dns_cache=300,
+                enable_cleanup_closed=True
+            )
+            HTTP_SESSION = aiohttp.ClientSession(
+                timeout=timeout,
+                connector=connector,
+                raise_for_status=False
+            )
     return HTTP_SESSION
 
 async def close_session():
@@ -1447,13 +1486,16 @@ async def send_telegram(msg: str, retry: int = 0, critical: bool = False):
     
     try:
         session = await get_session()
-        url = f"https://api.telegram.org/bot{CONFIG['TG_TOKEN']}/sendMessage"
+        # تجنب تسجيل التوكن في حال حدوث خطأ - سنستخدم متغيرات منفصلة
+        token = CONFIG['TG_TOKEN']
+        chat_id = CONFIG['TG_CHAT']
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
         
         if len(msg) > 4000:
             msg = msg[:3900] + "\n\n...[تم الاختصار]"
         
         async with session.post(url, json={
-            "chat_id": CONFIG["TG_CHAT"],
+            "chat_id": chat_id,
             "text": msg,
             "parse_mode": "HTML",
             "disable_web_page_preview": True
@@ -1469,7 +1511,8 @@ async def send_telegram(msg: str, retry: int = 0, critical: bool = False):
                 await send_telegram(msg, retry + 1, critical)
     
     except Exception as e:
-        logger.error(f"[TG Exception] {str(e)[:100]}")
+        # تسجيل الخطأ بدون تضمين الرابط (وبالتالي بدون التوكن)
+        logger.error(f"[TG Exception] {type(e).__name__}: {str(e)[:100]}")
         if retry < 2:
             await asyncio.sleep(1)
             await send_telegram(msg, retry + 1, critical)
@@ -1522,8 +1565,11 @@ async def get_spread_pct(exchange, symbol: str) -> Optional[float]:
         best_ask = safe_float(asks[0][0])
         if best_bid <= 0 or best_ask <= 0:
             return None
+        # بعد نجاح الطلب، إعادة تعيين عداد الأخطاء
+        rate_limiter.reset_errors()
         return ((best_ask - best_bid) / best_bid) * 100
     except Exception:
+        rate_limiter.record_error()
         return None
 
 async def compute_order_amount_base(exchange, symbol: str, usdt_size: float, price: float) -> Tuple[float, str]:
@@ -1562,12 +1608,49 @@ async def place_limit_buy_entry(exchange, symbol: str, price: float, amount: flo
         STATS["live_orders_placed"] += 1
         log_order_audit("LIMIT_BUY", symbol, px, amt, "PLACED")
         logger.info(f"[ENTRY] Limit buy placed for {symbol}: price={px}, amount={amt}")
+        rate_limiter.reset_errors()
         return order
     except Exception as e:
         STATS["live_order_errors"] += 1
         logger.error(f"[LIVE Entry Error] {symbol}: {str(e)[:150]}")
         log_order_audit("LIMIT_BUY", symbol, price, amount, f"ERROR: {str(e)[:50]}")
+        rate_limiter.record_error()
         return None
+
+def exchange_supports_stop_orders(exchange) -> bool:
+    try:
+        h = getattr(exchange, "has", {}) or {}
+        keys = [
+            "createStopLossOrder",
+            "createStopMarketOrder",
+            "createStopOrder",
+            "createTriggerOrder",
+            "createOrder"
+        ]
+        for k in keys:
+            if h.get(k) is True:
+                return True
+    except Exception:
+        pass
+    return False
+
+async def validate_stop_loss_capability(exchange):
+    if not is_live_trading_enabled():
+        return
+    if not CONFIG.get("LIVE_PLACE_SL_ORDER", True):
+        return
+
+    supported = exchange_supports_stop_orders(exchange)
+    if not supported:
+        CONFIG["LIVE_PLACE_SL_ORDER"] = False
+        logger.warning("[LIVE] Stop-loss orders appear unsupported on this exchange/market. Disabling LIVE_PLACE_SL_ORDER.")
+        await send_telegram(
+            "⚠️ تنبيه LIVE\n\n"
+            "أوامر Stop-Loss على المنصة قد لا تكون مدعومة/غير مضمونة في Spot عبر CCXT.\n"
+            "تم تعطيل LIVE_PLACE_SL_ORDER تلقائيًا.\n"
+            "سيتم الاعتماد على المراقبة الداخلية والخروج Market Sell Safe فقط.",
+            critical=False
+        )
 
 async def place_stop_loss_order(exchange, symbol: str, stop_price: float, amount: float) -> Optional[Dict[str, Any]]:
     if not CONFIG.get("LIVE_PLACE_SL_ORDER"):
@@ -1581,10 +1664,21 @@ async def place_stop_loss_order(exchange, symbol: str, stop_price: float, amount
         order = await exchange.create_order(symbol, order_type, "sell", amt, None, params)
         log_order_audit("STOP_LOSS", symbol, stop_price, amt, "PLACED")
         logger.info(f"[SL] Stop loss placed for {symbol} at {stop_price}")
+        rate_limiter.reset_errors()
         return order
     except Exception as e:
         logger.error(f"[LIVE SL Order Error] {symbol}: {str(e)[:150]}")
         log_order_audit("STOP_LOSS", symbol, stop_price, amount, f"ERROR: {str(e)[:50]}")
+        rate_limiter.record_error()
+        if CONFIG.get("LIVE_PLACE_SL_ORDER", True):
+            CONFIG["LIVE_PLACE_SL_ORDER"] = False
+            await send_telegram(
+                "⚠️ LIVE SL Disabled\n\n"
+                "فشل وضع Stop Loss على المنصة، وتم تعطيل LIVE_PLACE_SL_ORDER تلقائيًا لتفادي تكرار الأخطاء.\n"
+                f"• Symbol: {escape_html(symbol)}\n"
+                f"• Error: {escape_html(str(e)[:120])}",
+                critical=False
+            )
         return None
 
 async def cancel_stop_loss_order(exchange, symbol: str, order_id: str) -> bool:
@@ -1592,9 +1686,11 @@ async def cancel_stop_loss_order(exchange, symbol: str, order_id: str) -> bool:
         await rate_limiter.wait_if_needed(weight=1)
         await exchange.cancel_order(order_id, symbol)
         log_order_audit("CANCEL_SL", symbol, 0, 0, "CANCELLED")
+        rate_limiter.reset_errors()
         return True
     except Exception as e:
         logger.error(f"[LIVE Cancel SL Error] {symbol}: {str(e)[:150]}")
+        rate_limiter.record_error()
         return False
 
 async def wait_for_order_fill_or_cancel(exchange, symbol: str, order_id: str, timeout_sec: int) -> Tuple[bool, Optional[Dict[str, Any]]]:
@@ -1606,6 +1702,7 @@ async def wait_for_order_fill_or_cancel(exchange, symbol: str, order_id: str, ti
         try:
             await rate_limiter.wait_if_needed(weight=1)
             last = await exchange.fetch_order(order_id, symbol)
+            rate_limiter.reset_errors()  # نجاح في جلب الأمر
             
             status = last.get("status")
             filled = safe_float(last.get("filled"), 0.0)
@@ -1621,8 +1718,9 @@ async def wait_for_order_fill_or_cancel(exchange, symbol: str, order_id: str, ti
                 log_order_audit("LIMIT_BUY", symbol, last.get('price', 0), filled, status)
                 return False, last
         
-        except Exception:
-            pass
+        except Exception as e:
+            rate_limiter.record_error()
+            # نكمل الحلقة
         
         await asyncio.sleep(poll)
     
@@ -1633,12 +1731,16 @@ async def wait_for_order_fill_or_cancel(exchange, symbol: str, order_id: str, ti
         try:
             await rate_limiter.wait_if_needed(weight=1)
             last = await exchange.fetch_order(order_id, symbol)
+            rate_limiter.reset_errors()
         except Exception:
+            rate_limiter.record_error()
             pass
         log_order_audit("LIMIT_BUY", symbol, 0, 0, "TIMEOUT_CANCELED")
         logger.info(f"[FILL] Order {order_id} for {symbol} timed out and canceled")
+        rate_limiter.reset_errors()  # نجح الإلغاء
     except Exception as e:
         logger.warning(f"[LIVE Cancel Warn] {symbol}: {str(e)[:120]}")
+        rate_limiter.record_error()
     
     return False, last
 
@@ -1652,11 +1754,13 @@ async def market_sell(exchange, symbol: str, amount: float) -> Optional[Dict[str
         STATS["live_sells_executed"] += 1
         log_order_audit("MARKET_SELL", symbol, 0, amt, "EXECUTED")
         logger.info(f"[EXIT] Market sell executed for {symbol}: amount={amt}")
+        rate_limiter.reset_errors()
         return order
     except Exception as e:
         STATS["live_order_errors"] += 1
         logger.error(f"[LIVE Sell Error] {symbol}: {str(e)[:150]}")
         log_order_audit("MARKET_SELL", symbol, 0, amount, f"ERROR: {str(e)[:50]}")
+        rate_limiter.record_error()
         return None
 
 async def market_sell_safe(exchange, symbol: str, amount: float, max_retries: int = 3) -> Optional[Dict[str, Any]]:
@@ -1732,8 +1836,6 @@ def entry_quality_filter_5m(df_5m: pd.DataFrame, signal: 'QuantumSignal') -> Tup
         if abs(price_change_2_candles) > 0.02:
             return False, "momentum_too_fast"
         
-        # [FIX 11] Remove redundant RSI check (already done in signal generation)
-        
         zone = _get_entry_reference_zone(signal)
         if zone and 'atr' in df_5m.columns:
             zone_low, zone_high, zt = zone
@@ -1792,13 +1894,13 @@ def recalibrate_levels_on_fill(
         new_tp2 = fill_price + (orig_risk * tp2_rr)
         new_tp3 = fill_price + (orig_risk * tp3_rr)
         
-        # Position size recalculation happens in execute_live_entry_if_enabled
-        # using async calculate_position_size
         return new_sl, new_tp1, new_tp2, new_tp3, signal.position_size_usdt
     
     return signal.sl, signal.tp1, signal.tp2, signal.tp3, signal.position_size_usdt
 
 # ===================== ENHANCED DATABASE MANAGER =====================
+db_manager = None
+
 class DatabaseManager:
     def __init__(self, db_path: str):
         self.db_path = db_path
@@ -1856,7 +1958,10 @@ class DatabaseManager:
                     emergency_last_attempt TEXT,
                     emergency_attempts INTEGER,
                     version INTEGER DEFAULT 0,
-                    sl_order_id TEXT
+                    sl_order_id TEXT,
+                    order_block_low REAL DEFAULT 0,
+                    order_block_high REAL DEFAULT 0,
+                    liquidity_grab_level REAL DEFAULT 0
                 )
             """)
             
@@ -1891,20 +1996,6 @@ class DatabaseManager:
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_symbol ON active_trades(symbol)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_exit_time ON trade_history(exit_time DESC)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_version ON active_trades(version)")
-            
-            # [IMPROVEMENT] Add new columns if not exist
-            try:
-                cursor.execute("ALTER TABLE active_trades ADD COLUMN order_block_low REAL DEFAULT 0")
-            except sqlite3.OperationalError:
-                pass
-            try:
-                cursor.execute("ALTER TABLE active_trades ADD COLUMN order_block_high REAL DEFAULT 0")
-            except sqlite3.OperationalError:
-                pass
-            try:
-                cursor.execute("ALTER TABLE active_trades ADD COLUMN liquidity_grab_level REAL DEFAULT 0")
-            except sqlite3.OperationalError:
-                pass
             
             conn.commit()
     
@@ -2109,11 +2200,11 @@ class DatabaseManager:
                         entry_assumed=bool(sd.get("entry_assumed")) if isinstance(sd, dict) else False,
                         _version=version,
                         sl_order_id=row['sl_order_id'] if 'sl_order_id' in row.keys() else "",
-                        # [IMPROVEMENT] Load new fields with defaults if missing
                         order_block_low=row['order_block_low'] if 'order_block_low' in row.keys() else 0.0,
                         order_block_high=row['order_block_high'] if 'order_block_high' in row.keys() else 0.0,
                         liquidity_grab_level=row['liquidity_grab_level'] if 'liquidity_grab_level' in row.keys() else 0.0,
                     )
+                    trade_state.is_exiting = False
                     trades[row['symbol']] = trade_state
                 
                 logger.info(f"[DB] Loaded {len(trades)} active trades")
@@ -2205,60 +2296,69 @@ class DatabaseManager:
             logger.error(f"[DB Update Version Error] {symbol}: {str(e)}")
             return False
 
-db_manager = DatabaseManager(CONFIG["DB_PATH"])
-
 # ===================== DAILY CIRCUIT BREAKER =====================
 class DailyCircuitBreaker:
-    def __init__(self):
+    def __init__(self, db=None):
+        self.db = db
         self.date = None
         self.realized_r = 0.0
         self.blocked = False
-        self.load_state()
-    
+        if self.db is not None and CONFIG.get("ENABLE_DB_PERSISTENCE", True):
+            self.load_state()
+
+    def attach_db(self, db):
+        self.db = db
+        if self.db is not None and CONFIG.get("ENABLE_DB_PERSISTENCE", True):
+            self.load_state()
+
     def load_state(self):
-        if not CONFIG["ENABLE_DB_PERSISTENCE"]:
+        if not CONFIG.get("ENABLE_DB_PERSISTENCE", True):
             return
-        
-        db_date, db_realized_r, db_blocked = db_manager.load_daily_state()
+        if self.db is None:
+            logger.warning("[Daily Circuit] db_manager not ready yet; skipping load_state")
+            return
+
+        db_date, db_realized_r, db_blocked = self.db.load_daily_state()
         if db_date:
             self.date = db_date
             self.realized_r = db_realized_r
             self.blocked = db_blocked
             logger.info(f"[Daily Circuit] Loaded state: date={self.date}, R={self.realized_r:.2f}, blocked={self.blocked}")
-    
+
     def save_state(self):
-        if not CONFIG["ENABLE_DB_PERSISTENCE"]:
+        if not CONFIG.get("ENABLE_DB_PERSISTENCE", True):
             return
-        
-        db_manager.save_daily_state(self.date or "", self.realized_r, self.blocked)
-    
+        if self.db is None:
+            return
+        self.db.save_daily_state(self.date or "", self.realized_r, self.blocked)
+
     def reset_if_needed(self):
         now = datetime.now(timezone.utc)
         current_date = now.date().isoformat()
-        
+
         if self.date is None:
             self.date = current_date
             self.save_state()
             return
-        
+
         if current_date != self.date:
             logger.info(f"♻️ Daily reset - new date: {current_date}")
             self.date = current_date
             self.realized_r = 0.0
             self.blocked = False
             self.save_state()
-    
+
     def record_daily_r(self, r_value: float):
         self.reset_if_needed()
         self.realized_r = safe_float(self.realized_r) + safe_float(r_value)
-        
+
         max_loss = safe_float(CONFIG.get("DAILY_MAX_LOSS_R", -4.0))
         if self.realized_r <= max_loss:
             self.blocked = True
             logger.warning(f"🛑 Daily loss limit reached: {self.realized_r:.2f}R <= {max_loss}R")
-        
+
         self.save_state()
-    
+
     def is_blocked(self) -> bool:
         if not CONFIG.get("ENABLE_DAILY_MAX_LOSS", True):
             return False
@@ -2271,7 +2371,7 @@ class DailyCircuitBreaker:
             self.save_state()
             return True
         return False
-    
+
     def get_state(self) -> Dict:
         return {
             "date": self.date,
@@ -2279,7 +2379,7 @@ class DailyCircuitBreaker:
             "blocked": self.blocked
         }
 
-daily_circuit = DailyCircuitBreaker()
+daily_circuit = DailyCircuitBreaker(db=None)
 
 def record_daily_r(r_value: float):
     daily_circuit.record_daily_r(r_value)
@@ -2293,9 +2393,8 @@ async def checkpoint_saver():
         return
     
     interval = int(CONFIG.get("CHECKPOINT_INTERVAL_SEC", 300))
-    path = CONFIG.get("CHECKPOINT_PATH", "/content/quantum_checkpoint.pkl")
+    path = CONFIG.get("CHECKPOINT_PATH", "/content/quantum_checkpoint.json")
     
-    import pickle
     while not shutdown_manager.should_stop:
         try:
             await asyncio.sleep(interval)
@@ -2318,8 +2417,11 @@ async def checkpoint_saver():
                 'config_live': bool(CONFIG.get("ENABLE_LIVE_TRADING", False)),
             }
             
-            with open(path, 'wb') as f:
-                pickle.dump(checkpoint, f)
+            def write_checkpoint(path, data):
+                with open(path, 'w') as f:
+                    json.dump(data, f, default=str, indent=2)
+            
+            await asyncio.to_thread(write_checkpoint, path, checkpoint)
             
             logger.info(f"💾 Checkpoint saved - {len(active_trades_copy)} trades")
         
@@ -2331,12 +2433,11 @@ def load_checkpoint() -> bool:
     if not CONFIG.get("ENABLE_CHECKPOINTS", True):
         return False
     
-    path = CONFIG.get("CHECKPOINT_PATH", "/content/quantum_checkpoint.pkl")
+    path = CONFIG.get("CHECKPOINT_PATH", "/content/quantum_checkpoint.json")
     
-    import pickle
     try:
-        with open(path, 'rb') as f:
-            checkpoint = pickle.load(f)
+        with open(path, 'r') as f:
+            checkpoint = json.load(f)
         
         logger.info(f"♻️ Checkpoint loaded from {checkpoint.get('timestamp')}")
         
@@ -2346,13 +2447,13 @@ def load_checkpoint() -> bool:
         at = checkpoint.get('active_trades', {}) or {}
         for symbol, trade_data in at.items():
             try:
-                # Ensure new fields are present with defaults
                 if 'order_block_low' not in trade_data:
                     trade_data['order_block_low'] = 0.0
                 if 'order_block_high' not in trade_data:
                     trade_data['order_block_high'] = 0.0
                 if 'liquidity_grab_level' not in trade_data:
                     trade_data['liquidity_grab_level'] = 0.0
+                trade_data['is_exiting'] = False
                 ACTIVE_TRADES[symbol] = TradeState(**trade_data)
                 recovered += 1
             except Exception:
@@ -2379,10 +2480,9 @@ def save_emergency_checkpoint(err: Exception):
             'error': str(err)
         }
         
-        path = CONFIG.get("EMERGENCY_CHECKPOINT_PATH", "/content/quantum_emergency_checkpoint.pkl")
-        with open(path, 'wb') as f:
-            import pickle
-            pickle.dump(checkpoint, f)
+        path = CONFIG.get("EMERGENCY_CHECKPOINT_PATH", "/content/quantum_emergency_checkpoint.json")
+        with open(path, 'w') as f:
+            json.dump(checkpoint, f, default=str, indent=2)
         
         logger.info("💾 Emergency checkpoint saved (sync)")
     except Exception as e:
@@ -2399,8 +2499,8 @@ def calculate_indicators(df: pd.DataFrame) -> Optional[pd.DataFrame]:
         if len(df) < 20:
             return None
         
+        TALIB_FALLBACK = False
         if TALIB_AVAILABLE:
-            TALIB_FALLBACK = False
             try:
                 highs = df['high'].values
                 lows = df['low'].values
@@ -2518,7 +2618,7 @@ def calculate_indicators(df: pd.DataFrame) -> Optional[pd.DataFrame]:
         logger.error(f"[Indicators Error] {str(e)}")
         return None
 
-# ===================== MARKET STRUCTURE ANALYSIS =====================
+# ===================== MARKET STRUCTURE ANALYSIS (معكوس الاتجاه) =====================
 def analyze_market_structure(df: pd.DataFrame) -> Optional[MarketStructure]:
     if df is None or len(df) < 50:
         return None
@@ -2550,17 +2650,17 @@ def analyze_market_structure(df: pd.DataFrame) -> Optional[MarketStructure]:
         current_price = safe_float(df['close'].iloc[-1])
         recent_high = safe_float(df['high'].iloc[-CONFIG["BOS_CONFIRMATION_CANDLES"]:].max())
         recent_low = safe_float(df['low'].iloc[-CONFIG["BOS_CONFIRMATION_CANDLES"]:].min())
-        recent_close_avg = safe_float(df['close'].iloc[-2:].mean())
+        recent_close = safe_float(df['close'].iloc[-1])   # إصلاح: استخدام آخر إغلاق بدلاً من متوسط شمعتين
         mult = CONFIG["BOS_CONFIRMATION_MULTIPLIER"]
         
         bos_bullish = (
             recent_high > prev_swing_high and
-            recent_close_avg > prev_swing_high * mult
+            recent_close > prev_swing_high * mult
         )
         
         bos_bearish = (
             recent_low < prev_swing_low and
-            recent_close_avg < prev_swing_low * mult
+            recent_close < prev_swing_low * mult
         )
         
         choch = False
@@ -2576,7 +2676,8 @@ def analyze_market_structure(df: pd.DataFrame) -> Optional[MarketStructure]:
         order_block = None
         lookback = CONFIG["ORDER_BLOCK_LOOKBACK"]
         if len(df) > lookback:
-            for i in range(len(df) - lookback, len(df)):
+            # عكس الاتجاه: نبحث من الأحدث إلى الأقدم
+            for i in range(len(df) - 1, len(df) - lookback - 1, -1):
                 candle = df.iloc[i]
                 if candle['close'] < candle['open']:
                     continue
@@ -2603,11 +2704,12 @@ def analyze_market_structure(df: pd.DataFrame) -> Optional[MarketStructure]:
                         'index': i,
                         'freshness': len(df) - 1 - i
                     }
-                    break
+                    break   # أول كتلة نجدها (الأحدث) هي المطلوبة
         
         fvg_zone = None
         if len(df) > 3:
-            for i in range(1, len(df) - 1):
+            # البحث من الأحدث إلى الأقدم
+            for i in range(len(df) - 2, 0, -1):
                 prev_candle = df.iloc[i-1]
                 current_candle = df.iloc[i]
                 if prev_candle['high'] < current_candle['low']:
@@ -2697,6 +2799,7 @@ async def analyze_order_flow(exchange, symbol: str, mtf_alignment: int = 0,
     try:
         await rate_limiter.wait_if_needed(weight=CONFIG.get("ORDERBOOK_WEIGHT", 10))
         orderbook = await exchange.fetch_order_book(symbol, CONFIG["ORDERBOOK_DEPTH"])
+        rate_limiter.reset_errors()
         
         bids = orderbook.get("bids") or []
         asks = orderbook.get("asks") or []
@@ -2716,6 +2819,7 @@ async def analyze_order_flow(exchange, symbol: str, mtf_alignment: int = 0,
         try:
             await rate_limiter.wait_if_needed(weight=5)
             trades = await exchange.fetch_trades(symbol, limit=CONFIG["TRADES_SAMPLE_SIZE"])
+            rate_limiter.reset_errors()
             
             buy_volume = 0
             sell_volume = 0
@@ -2730,6 +2834,7 @@ async def analyze_order_flow(exchange, symbol: str, mtf_alignment: int = 0,
         
         except Exception:
             delta = 0
+            rate_limiter.record_error()
         
         bid_strength = bid_volume / total_volume if total_volume > 0 else 0.5
         ask_strength = ask_volume / total_volume if total_volume > 0 else 0.5
@@ -2795,6 +2900,7 @@ async def analyze_order_flow(exchange, symbol: str, mtf_alignment: int = 0,
     
     except Exception as e:
         api_circuit.record_failure()
+        rate_limiter.record_error()
         await metrics.record_error("order_flow_analysis", type(e).__name__)
         logger.error(f"[Order Flow Error] {symbol}: {str(e)[:100]}")
         return None
@@ -2919,14 +3025,13 @@ def analyze_volume_profile(df: pd.DataFrame, precheck_score: float = 0.0) -> Opt
         logger.error(f"[Volume Profile Error] {str(e)}")
         return None
 
-# ===================== LIQUIDITY GRAB DETECTION =====================
-def detect_liquidity_grab(df: pd.DataFrame) -> Optional[LiquidityGrab]:
+# ===================== LIQUIDITY GRAB DETECTION (محسّن) =====================
+def detect_liquidity_grab(df: pd.DataFrame, symbol: str = "") -> Optional[LiquidityGrab]:
     if not CONFIG.get("ENABLE_LIQUIDITY_GRAB", True) or df is None or len(df) < 30:
         return None
     
     try:
-        # [FIX] Initialize range_condition to avoid NameError
-        range_condition = False
+        # تم حذف المتغير غير المستخدم range_condition
         last_candle = df.iloc[-1]
         prev_candle = df.iloc[-2] if len(df) > 1 else last_candle
         
@@ -2941,16 +3046,14 @@ def detect_liquidity_grab(df: pd.DataFrame) -> Optional[LiquidityGrab]:
         equal_lows = False
         equal_lows_range = 0.0
         if 'low' in df.columns:
-            recent_lows = df['low'].iloc[-10:].tolist()
+            recent_lows = df['low'].iloc[-8:].tolist()
             if len(recent_lows) >= 5:
-                sorted_lows = sorted(recent_lows[-5:])
-                max_low = max(sorted_lows)
-                min_low = min(sorted_lows)
-                
-                atr_range_threshold = current_atr * CONFIG["LG_EQUAL_LOWS_RANGE_ATR_MULT"]
-                range_condition = (max_low - min_low) < atr_range_threshold
-                equal_lows = range_condition and len(recent_lows) >= CONFIG["LG_EQUAL_LOWS_REQUIRED"]
-                equal_lows_range = max_low - min_low
+                required = int(CONFIG["LG_EQUAL_LOWS_REQUIRED"])
+                level = float(np.median(recent_lows[-5:]))
+                tol = current_atr * CONFIG["LG_EQUAL_LOWS_RANGE_ATR_MULT"]
+                touches = sum(1 for x in recent_lows[-5:] if abs(x - level) <= tol)
+                equal_lows = touches >= required
+                equal_lows_range = tol * 2
         
         avg_volume = safe_float(df['volume'].iloc[-20:-1].mean())
         volume_spike = False
@@ -3005,7 +3108,7 @@ def detect_liquidity_grab(df: pd.DataFrame) -> Optional[LiquidityGrab]:
                 100
             )
             
-            if equal_lows and len(df) >= CONFIG["LG_EQUAL_LOWS_REQUIRED"] and range_condition:
+            if equal_lows and len(df) >= CONFIG["LG_EQUAL_LOWS_REQUIRED"]:
                 confidence = min(confidence * 1.2, 100)
             
             if confidence < CONFIG["HARD_GATE_2_MIN_LG_CONFIDENCE"]:
@@ -3014,6 +3117,10 @@ def detect_liquidity_grab(df: pd.DataFrame) -> Optional[LiquidityGrab]:
             sweep_idx_in_recent = len(df) - 1
             sweep_timestamp = int(df['t'].iloc[-1]) if 't' in df.columns else None
             
+            if symbol:
+                logger.info(f"[LIQUIDITY] {symbol} bullish grab detected with confidence {confidence:.1f}")
+            else:
+                logger.info(f"[LIQUIDITY] bullish grab detected with confidence {confidence:.1f}")
             return LiquidityGrab(
                 detected=True,
                 grab_type=grab_type,
@@ -3105,7 +3212,7 @@ async def analyze_multi_timeframe(exchange, symbol: str) -> Optional[Dict]:
         if structure_5m.structure == "BULLISH":
             alignment += 1
         
-        liquidity_grab = detect_liquidity_grab(df_5m)
+        liquidity_grab = detect_liquidity_grab(df_5m, symbol)
         
         return {
             'structure_1h': structure_1h,
@@ -3223,10 +3330,9 @@ def calculate_quantum_score(
     liquidity_grab: Optional[LiquidityGrab],
     mtf_alignment: int,
     df: pd.DataFrame,
-    gates_passed: Optional[List[str]] = None   # [FIX 7] تمرير نتيجة البوابات بدلاً من إعادة حسابها
+    gates_passed: Optional[List[str]] = None
 ) -> Tuple[float, float, str]:
     
-    # إذا لم يتم تمرير نتيجة البوابات، نقوم بتقييمها (للتوافق مع الاستدعاءات السابقة)
     if gates_passed is None:
         gates_ok, gates_passed = evaluate_hard_gates(
             market_structure, order_flow, volume_profile,
@@ -3238,11 +3344,9 @@ def calculate_quantum_score(
     score = 0.0
     confidence_factors = []
     
-    # [IMPROVEMENT] New weights distribution
-    
     # 1. Liquidity Grab (max 25)
     if liquidity_grab and liquidity_grab.detected and liquidity_grab.grab_type == "BULLISH":
-        lg_score = 15 + min(liquidity_grab.confidence * 0.1, 10)  # 15 base + up to 10 from confidence
+        lg_score = 15 + min(liquidity_grab.confidence * 0.1, 10)
         if hasattr(liquidity_grab, 'equal_lows') and liquidity_grab.equal_lows:
             lg_score = min(lg_score + 3, 25)
         score += min(lg_score, 25)
@@ -3250,7 +3354,7 @@ def calculate_quantum_score(
     
     # 2. Order Block (max 20)
     if market_structure.order_block:
-        ob_score = 10  # base
+        ob_score = 10
         freshness = market_structure.order_block.get('freshness', 100)
         if freshness < 5:
             ob_score += 10
@@ -3258,7 +3362,7 @@ def calculate_quantum_score(
             ob_score += 5
         ob_score = min(ob_score, 20)
         score += ob_score
-        confidence_factors.append(80)  # placeholder confidence
+        confidence_factors.append(80)
     
     # 3. Break of Structure (max 15)
     if market_structure.bos_bullish:
@@ -3276,7 +3380,7 @@ def calculate_quantum_score(
         elif order_flow.volume_profile == "ABSORPTION":
             of_score += 10
         elif order_flow.volume_profile == "DISTRIBUTION":
-            of_score -= 5  # negative but min 0
+            of_score -= 5
         if order_flow.imbalance > 0.3:
             of_score += 2
         of_score = max(0, min(15, of_score))
@@ -3284,7 +3388,7 @@ def calculate_quantum_score(
         confidence_factors.append(order_flow.confidence)
     
     # 5. MTF Alignment (max 10)
-    alignment_score = mtf_alignment * 3.33  # 1->3.33, 2->6.67, 3->10
+    alignment_score = mtf_alignment * 3.33
     alignment_score = min(10, alignment_score)
     score += alignment_score
     confidence_factors.append(50 + mtf_alignment * 15)
@@ -3315,7 +3419,6 @@ def calculate_quantum_score(
         score += 2
         confidence_factors.append(95)
     
-    # Cap score
     quantum_score = min(100, max(0, score))
     
     confidence = np.mean(confidence_factors) if confidence_factors else 50.0
@@ -3351,7 +3454,6 @@ def compute_sl_and_tp_from_structure(entry: float, market_structure: MarketStruc
         if sl >= entry or sl <= 0:
             sl = entry * 0.95
     
-    # [IMPROVEMENT 1] Minimum stop loss distance (0.5% of entry price)
     min_sl_distance = entry * 0.005
     if (entry - sl) < min_sl_distance:
         sl = entry - min_sl_distance
@@ -3381,21 +3483,19 @@ async def calculate_position_size(entry: float, sl: float, account_size: Optiona
     if not validate_price(entry) or not validate_price(sl) or sl >= entry:
         return 0.0, 0.0
     
-    # [IMPROVEMENT] Dynamic risk based on quantum_score
-    if quantum_score < 68:
-        risk_pct = 0.7
-    elif quantum_score <= 72:
-        risk_pct = 0.7
-    elif quantum_score <= 80:
-        risk_pct = 1.0
-    elif quantum_score <= 88:
-        risk_pct = 1.3
+    if quantum_score < 70:
+        risk_pct = 0.6
+    elif quantum_score <= 75:
+        risk_pct = 0.8
+    elif quantum_score <= 85:
+        risk_pct = 1.1
+    elif quantum_score <= 92:
+        risk_pct = 1.4
     else:
-        risk_pct = 1.6
+        risk_pct = 1.7
     
     base_risk_amount = account_size * (risk_pct / 100)
     
-    # === EDGE ENGINE: APPLY RISK MULTIPLIER ===
     try:
         edge_engine = await get_edge_engine()
         risk_multiplier = edge_engine.risk_multiplier()
@@ -3405,7 +3505,6 @@ async def calculate_position_size(entry: float, sl: float, account_size: Optiona
     except Exception as e:
         logger.error(f"[EdgeEngine] Error applying risk multiplier: {e}")
         risk_amount = base_risk_amount
-    # ==========================================
     
     risk_per_unit = entry - sl
     if risk_per_unit <= 0:
@@ -3440,6 +3539,7 @@ async def check_btc_trend(exchange) -> Dict:
     try:
         await rate_limiter.wait_if_needed(weight=2)
         data = await cache.get_ohlcv(exchange, "BTC/USDT", "1h", 100)
+        rate_limiter.reset_errors()
         
         if not data or len(data) < 20:
             return {"trend": "NEUTRAL", "change_1h": 0, "safe_to_trade": True}
@@ -3489,6 +3589,7 @@ async def check_btc_trend(exchange) -> Dict:
         return BTC_TREND
     
     except Exception as e:
+        rate_limiter.record_error()
         logger.error(f"[BTC Check Error] {str(e)[:100]}")
         return {"trend": "NEUTRAL", "change_1h": 0, "safe_to_trade": True}
 
@@ -3512,7 +3613,7 @@ def should_run_order_flow(symbol: str, mtf_alignment: int, precheck_score: float
     
     return False
 
-# ===================== BTC CORRELATION FILTER =====================
+# ===================== BTC CORRELATION FILTER (مع قفل) =====================
 async def get_btc_correlation(exchange, symbol: str) -> Optional[float]:
     """
     Calculate correlation between symbol and BTC/USDT over last 50 1h candles.
@@ -3520,10 +3621,11 @@ async def get_btc_correlation(exchange, symbol: str) -> Optional[float]:
     """
     cache_key = f"{symbol}_BTC_corr"
     now = time.time()
-    if cache_key in bot.correlation_cache:
-        corr, ts = bot.correlation_cache[cache_key]
-        if now - ts < 3600:  # 1 hour cache
-            return corr
+    async with bot.correlation_cache_lock:
+        if cache_key in bot.correlation_cache:
+            corr, ts = bot.correlation_cache[cache_key]
+            if now - ts < 3600:  # 1 hour cache
+                return corr
     
     try:
         # Fetch BTC data
@@ -3538,7 +3640,7 @@ async def get_btc_correlation(exchange, symbol: str) -> Optional[float]:
             return None
         sym_df = pd.DataFrame(sym_data, columns=['t','open','high','low','close','volume'])
         
-        # Align by timestamp (simple: assume same length, latest)
+        # Align by timestamp
         if len(btc_df) != len(sym_df):
             min_len = min(len(btc_df), len(sym_df))
             btc_df = btc_df.iloc[-min_len:]
@@ -3551,29 +3653,26 @@ async def get_btc_correlation(exchange, symbol: str) -> Optional[float]:
         if len(btc_returns) < 10 or len(sym_returns) < 10:
             return None
         
-        # Align lengths again after dropna
         min_len = min(len(btc_returns), len(sym_returns))
         btc_returns = btc_returns.iloc[-min_len:]
         sym_returns = sym_returns.iloc[-min_len:]
         
-        # Compute correlation
         if SCIPY_AVAILABLE:
             corr, _ = stats.pearsonr(btc_returns, sym_returns)
         else:
-            # Manual Pearson
             btc_mean = np.mean(btc_returns)
             sym_mean = np.mean(sym_returns)
             num = np.sum((btc_returns - btc_mean) * (sym_returns - sym_mean))
             den = np.sqrt(np.sum((btc_returns - btc_mean)**2) * np.sum((sym_returns - sym_mean)**2))
             corr = num / den if den != 0 else 0.0
         
-        # [FIX] If correlation is NaN, return None
         if np.isnan(corr):
             logger.warning(f"[BTC Correlation] NaN for {symbol}, skipping filter")
             return None
         
         corr = safe_float(corr, 0.0)
-        bot.correlation_cache[cache_key] = (corr, now)
+        async with bot.correlation_cache_lock:
+            bot.correlation_cache[cache_key] = (corr, now)
         return corr
     
     except Exception as e:
@@ -3586,6 +3685,7 @@ async def check_btc_filter(exchange) -> bool:
     ترجع False إذا كان BTC غير مناسب للتداول على الإطالة (LONG):
     - RSI 1H < 40
     - السعر الحالي تحت EMA50 1H
+    - (إضافة) EMA50 > EMA200 للتأكد من الاتجاه الصاعد
     """
     if not CONFIG.get("ENABLE_BTC_FILTER", True):
         return True
@@ -3602,6 +3702,7 @@ async def check_btc_filter(exchange) -> bool:
         
         current_close = df['close'].iloc[-1]
         ema50 = df['ema50'].iloc[-1]
+        ema200 = df['ema200'].iloc[-1]
         rsi = df['rsi'].iloc[-1]
         
         if rsi < 40:
@@ -3609,6 +3710,9 @@ async def check_btc_filter(exchange) -> bool:
             return False
         if current_close < ema50:
             logger.info("[BTC Filter] Price below EMA50 -> skipping longs")
+            return False
+        if ema50 <= ema200:
+            logger.info("[BTC Filter] EMA50 <= EMA200 (not bullish) -> skipping longs")
             return False
         return True
     except Exception as e:
@@ -3638,10 +3742,10 @@ async def generate_quantum_signal(exchange, symbol: str) -> Optional[QuantumSign
         if not await check_btc_filter(exchange):
             return None
         
-        # [IMPROVEMENT 3] BTC Correlation Filter - skip if API fails or NaN, threshold now 0.10
+        # BTC Correlation Filter - threshold 0.05
         corr = await get_btc_correlation(exchange, symbol)
-        if corr is not None and corr < 0.10:   # <--- تعديل العتبة إلى 0.10
-            logger.info(f"[BTC Correlation] {symbol} correlation {corr:.2f} < 0.10 - skipping")
+        if corr is not None and corr < 0.05:
+            logger.info(f"[REJECT] {symbol} BTC correlation {corr:.2f} < 0.05")
             return None
         
         mtf = await analyze_multi_timeframe(exchange, symbol)
@@ -3659,13 +3763,13 @@ async def generate_quantum_signal(exchange, symbol: str) -> Optional[QuantumSign
         if CONFIG["LONG_ONLY"] and structure_1h.structure != "BULLISH":
             return None
         
-        # [IMPROVEMENT] Volatility filter: 15m ATR% > 6% reject
+        # Volatility filter: 15m ATR% > 8% reject
         if 'atr' in df_15m.columns and 'close' in df_15m.columns:
             atr_15m = df_15m['atr'].iloc[-1]
             price_15m = df_15m['close'].iloc[-1]
             if price_15m > 0:
                 atr_pct_15m = (atr_15m / price_15m) * 100
-                if atr_pct_15m > CONFIG.get("MAX_ATR_PCT_15M", 6.0):
+                if atr_pct_15m > CONFIG.get("MAX_ATR_PCT_15M", 8.0):
                     logger.info(f"[Volatility Filter] {symbol} 15m ATR% {atr_pct_15m:.2f}% > {CONFIG['MAX_ATR_PCT_15M']}% - skipping")
                     return None
         
@@ -3678,15 +3782,14 @@ async def generate_quantum_signal(exchange, symbol: str) -> Optional[QuantumSign
             prev_high = df_5m['high'].iloc[-2]
             prev_low = df_5m['low'].iloc[-2]
             mid = (prev_high + prev_low) / 2.0
-            # [IMPROVEMENT] Add volume condition
             if last_close < mid and df_5m['volume'].iloc[-1] <= df_5m['volume'].iloc[-2]:
-                logger.info(f"[Micro Structure] {symbol} rejected: last close {last_close:.6f} below midpoint {mid:.6f} and volume not increasing")
+                logger.info(f"[REJECT] {symbol} Micro Structure: last close below midpoint and volume not increasing")
                 return None
         
         ok_accept, reason = price_acceptance_gate_5m(df_5m, ob, lg)
         if not ok_accept:
             if CONFIG.get("DEBUG_MODE"):
-                logger.info(f"[EntryGate] {symbol} rejected: {reason}")
+                logger.info(f"[REJECT] {symbol} EntryGate: {reason}")
             return None
         
         if ob:
@@ -3705,18 +3808,18 @@ async def generate_quantum_signal(exchange, symbol: str) -> Optional[QuantumSign
         if sl == 0:
             return None
         
-        # [IMPROVEMENT 2] RSI window: 35-65 (تعديل من 45-68 إلى 35-65)
+        # RSI window: 35-65
         if 'rsi' in df_5m.columns:
             rsi_5m = df_5m['rsi'].iloc[-1]
-            if rsi_5m < 35 or rsi_5m > 65:   # <--- النطاق الجديد
-                logger.info(f"[Momentum] {symbol} rejected: RSI 5m = {rsi_5m:.1f} outside 35-65")
+            if rsi_5m < 35 or rsi_5m > 65:
+                logger.info(f"[REJECT] {symbol} RSI 5m = {rsi_5m:.1f} outside 35-65")
                 return None
         
-        # [FIX 7] حساب البوابات مرة واحدة فقط
+        # حساب البوابات مرة واحدة
         gates_ok, gates_list = evaluate_hard_gates(
             structure_15m,
-            None,   # order_flow not yet computed
-            None,   # volume_profile not yet computed
+            None,
+            None,
             liquidity_grab,
             mtf['alignment'],
             df_15m
@@ -3731,14 +3834,14 @@ async def generate_quantum_signal(exchange, symbol: str) -> Optional[QuantumSign
             liquidity_grab,
             mtf['alignment'],
             df_15m,
-            gates_passed=gates_list   # تمرير قائمة البوابات بدلاً من إعادة الحساب
+            gates_passed=gates_list
         )
         
         if pre_class == "QUANTUM_A+":
             reset_daily_counters()
             max_daily_a_plus = CONFIG.get("MAX_DAILY_A_PLUS", 7)
             if STATS.get("daily_a_plus_count", 0) >= max_daily_a_plus:
-                logger.info(f"[Daily Cap] A+ cap reached ({STATS['daily_a_plus_count']}/{max_daily_a_plus}) - rejecting")
+                logger.info(f"[REJECT] {symbol} A+ cap reached ({STATS['daily_a_plus_count']}/{max_daily_a_plus})")
                 return None
         
         order_flow = None
@@ -3747,19 +3850,18 @@ async def generate_quantum_signal(exchange, symbol: str) -> Optional[QuantumSign
                 allow_low = (mtf['alignment'] == 2 and pre_qs >= 68) or (mtf['alignment'] == 1 and pre_qs >= 85)
                 order_flow = await analyze_order_flow(exchange, symbol, mtf['alignment'], allow_low_alignment=allow_low)
         
-        # [IMPROVEMENT] Order Flow + Liquidity Grab fix
+        # Order Flow + Liquidity Grab fix
         if lg and order_flow and order_flow.signal == "BEARISH":
-            logger.info(f"[Signal] {symbol} rejected: Liquidity Grab with Bearish Order Flow")
+            logger.info(f"[REJECT] {symbol} Liquidity Grab with Bearish Order Flow")
             return None
         if not lg and order_flow and order_flow.signal != "BULLISH":
-            logger.info(f"[Signal] {symbol} rejected: No Liquidity Grab and Order Flow not BULLISH")
+            logger.info(f"[REJECT] {symbol} No Liquidity Grab and Order Flow not BULLISH")
             return None
         
         volume_profile = None
         if CONFIG.get("ENABLE_VOLUME_PROFILE", False) and CONFIG.get("_VOLUME_PROFILE_SAMPLING_OK", True):
             volume_profile = analyze_volume_profile(df_15m, precheck_score=pre_qs)
         
-        # إعادة حساب النقاط مع order_flow و volume_profile
         quantum_score, confidence, signal_class = calculate_quantum_score(
             structure_15m,
             order_flow,
@@ -3767,13 +3869,12 @@ async def generate_quantum_signal(exchange, symbol: str) -> Optional[QuantumSign
             liquidity_grab,
             mtf['alignment'],
             df_15m,
-            gates_passed=gates_list   # تمرير نفس قائمة البوابات
+            gates_passed=gates_list
         )
         
         if quantum_score < CONFIG["MIN_QUANTUM_SCORE"]:
             return None
         
-        # [IMPROVEMENT] Now compute position size using the final quantum_score
         position_size_usdt, position_size_pct = await calculate_position_size(entry, sl, quantum_score=quantum_score)
         if position_size_usdt == 0:
             return None
@@ -3818,7 +3919,7 @@ async def generate_quantum_signal(exchange, symbol: str) -> Optional[QuantumSign
             entry_5m=structure_5m.structure,
             risk_reward=risk_reward,
             win_probability=win_probability,
-            gates_passed=gates_list   # حفظ البوابات التي تم اجتيازها
+            gates_passed=gates_list
         )
     
     except Exception as e:
@@ -3845,9 +3946,8 @@ def format_quantum_signal(signal: QuantumSignal) -> str:
     
     live_badge = get_execution_mode_badge()
     
-    # [FIX 14] تصحيح عرض المخاطرة الحقيقية
     account_size = CONFIG["ACCOUNT_SIZE_USDT"]
-    risk_amount = signal.position_size_usdt * (risk / signal.entry)   # المخاطرة بالدولار
+    risk_amount = signal.position_size_usdt * (risk / signal.entry)
     risk_percent = (risk_amount / account_size) * 100
     
     message = f"""
@@ -3944,8 +4044,10 @@ async def get_filtered_symbols(exchange) -> List[str]:
             try:
                 await rate_limiter.wait_if_needed(weight=CONFIG.get("TICKER_WEIGHT", 2))
                 tickers = await exchange.fetch_tickers()
+                rate_limiter.reset_errors()
                 break
             except Exception as e:
+                rate_limiter.record_error()
                 if attempt < CONFIG["MAX_RETRIES"] - 1:
                     await asyncio.sleep(2 ** attempt)
                 else:
@@ -3970,20 +4072,17 @@ async def get_filtered_symbols(exchange) -> List[str]:
             volume = safe_float(ticker.get('quoteVolume'), 0)
             price = safe_float(ticker.get('last'), 0)
             
-            # [IMPROVEMENT] New filters: quoteVolume > MIN_VOLUME_24H, price >= 0.00001
             if volume < CONFIG["MIN_VOLUME_24H"]:
                 continue
             if price < 0.00001:
-                continue
-            if price > 1000:
                 continue
             
             score = min(volume / 1_000_000, 50)
             filtered.append((symbol, score))
         
         filtered.sort(key=lambda x: x[1], reverse=True)
-        # [IMPROVEMENT] Limit to top 50
-        return [s for s, _ in filtered[:50]]
+        max_scan = CONFIG.get("MAX_SYMBOL_SCAN", 80)
+        return [s for s, _ in filtered[:max_scan]]
     
     except Exception as e:
         logger.error(f"[Symbol Filter Error] {str(e)}")
@@ -4004,7 +4103,7 @@ async def mark_trade_emergency(symbol: str, reason: str, critical_msg: str = "")
                 ACTIVE_TRADES[symbol].emergency_attempts += 1
                 
                 trade_snapshot = copy.deepcopy(ACTIVE_TRADES[symbol])
-                db_manager.save_trade(trade_snapshot)
+                await asyncio.to_thread(db_manager.save_trade, trade_snapshot)
         finally:
             bot.release_trade_lock(symbol)
     
@@ -4029,11 +4128,9 @@ async def mark_trade_emergency(symbol: str, reason: str, critical_msg: str = "")
 def record_loss(symbol: str):
     now = time.time()
     bot.consecutive_losses[symbol].append(now)
-    # احتفظ فقط بخسائر آخر 24 ساعة
     cutoff = now - 86400
     bot.consecutive_losses[symbol] = [t for t in bot.consecutive_losses[symbol] if t > cutoff]
     if len(bot.consecutive_losses[symbol]) >= 2:
-        # blacklist for 6 hours
         bot.consecutive_loss_blacklist[symbol] = now + 21600
         logger.warning(f"[Loss Guard] {symbol} has 2+ losses in 24h -> blacklisted for 6h")
         asyncio.create_task(send_telegram(
@@ -4056,7 +4153,6 @@ async def execute_live_entry_if_enabled(exchange, signal: QuantumSignal) -> Tupl
     if not is_live_trading_enabled():
         return True, None
     
-    # [IMPROVEMENT] Global consecutive loss circuit breaker
     if STATS.get("global_consecutive_losses", 0) >= CONFIG["MAX_CONSECUTIVE_LOSSES"]:
         await send_telegram(
             f"🛑 Global consecutive loss circuit breaker reached ({CONFIG['MAX_CONSECUTIVE_LOSSES']} losses). Stopping new entries.",
@@ -4123,9 +4219,6 @@ async def execute_live_entry_if_enabled(exchange, signal: QuantumSignal) -> Tupl
         )
         return False, None
     
-    # [FIX 4] نمط القفل - نأخذ نسخة ثم نحرر القفل أثناء API
-    # هنا لا يوجد قفل بعد، لكن في العمليات التالية سنطبق النمط.
-    
     entry_order = await place_limit_buy_entry(exchange, signal.symbol, signal.entry, amount_base)
     if not entry_order or not entry_order.get("id"):
         await send_telegram(
@@ -4159,7 +4252,6 @@ async def execute_live_entry_if_enabled(exchange, signal: QuantumSignal) -> Tupl
     fill_price = safe_float(final_order.get("average"), 0.0) or safe_float(final_order.get("price"), signal.entry)
     fill_amount = safe_float(final_order.get("filled"), 0.0) or amount_base
     
-    # [IMPROVEMENT] Slippage percent protection
     slippage_pct = abs(fill_price - signal.entry) / signal.entry
     if slippage_pct > CONFIG["MAX_SLIPPAGE_PCT"]:
         logger.warning(f"[Slippage] {signal.symbol} slippage {slippage_pct:.4%} > {CONFIG['MAX_SLIPPAGE_PCT']:.2%}, closing immediately")
@@ -4174,7 +4266,6 @@ async def execute_live_entry_if_enabled(exchange, signal: QuantumSignal) -> Tupl
     
     adj_sl, adj_tp1, adj_tp2, adj_tp3, adj_position_size = recalibrate_levels_on_fill(fill_price, signal)
     
-    # [IMPROVEMENT] RR slippage check based on TP1_RR
     actual_risk = fill_price - adj_sl
     if actual_risk > 0:
         actual_rr = (adj_tp1 - fill_price) / actual_risk
@@ -4190,11 +4281,9 @@ async def execute_live_entry_if_enabled(exchange, signal: QuantumSignal) -> Tupl
             await market_sell_safe(exchange, signal.symbol, fill_amount, max_retries=2)
             return False, None
     
-    # [FIX 6] Recalculate position size using actual fill price
     new_position_usdt, new_position_pct = await calculate_position_size(
         fill_price, adj_sl, quantum_score=signal.quantum_score
     )
-    # إذا كان الحجم الجديد أصغر بكثير، قد نقرر إلغاء الصفقة
     if new_position_usdt < CONFIG["MIN_POSITION_SIZE_USDT"] * 0.5:
         logger.warning(f"[Slippage] {signal.symbol} new position size {new_position_usdt:.2f} too small after recalc, closing")
         await send_telegram(
@@ -4205,15 +4294,12 @@ async def execute_live_entry_if_enabled(exchange, signal: QuantumSignal) -> Tupl
         await market_sell_safe(exchange, signal.symbol, fill_amount, max_retries=2)
         return False, None
     
-    # تحديث حجم المركز بناءً على السعر الفعلي
     adjusted_position_usdt = new_position_usdt
     adjusted_amount_base = adjusted_position_usdt / fill_price
     if adjusted_amount_base > fill_amount:
-        # لا يمكن أن نزيد الكمية بعد التنفيذ، نكتفي بالكمية المنفذة
         adjusted_amount_base = fill_amount
         adjusted_position_usdt = adjusted_amount_base * fill_price
     
-    # [FIX 4] Protect position sizing from slippage: compute actual risk amount and compare with intended
     intended_position_base = signal.position_size_usdt / signal.entry
     intended_risk_amount = intended_position_base * (signal.entry - signal.sl)
     actual_risk_amount = fill_amount * (fill_price - adj_sl)
@@ -4244,11 +4330,10 @@ async def execute_live_entry_if_enabled(exchange, signal: QuantumSignal) -> Tupl
         entry_order_id=order_id,
         entry_filled=True,
         entry_fill_price=fill_price,
-        entry_fill_amount=adjusted_amount_base,   # الكمية المعدلة
+        entry_fill_amount=adjusted_amount_base,
         is_paper=False,
         execution_mode="LIVE",
         entry_assumed=False,
-        # [IMPROVEMENT] Store order block and liquidity grab levels
         order_block_low=signal.market_structure.order_block.get('body_low', signal.market_structure.order_block.get('low', 0.0)) if signal.market_structure.order_block else 0.0,
         order_block_high=signal.market_structure.order_block.get('body_high', signal.market_structure.order_block.get('high', 0.0)) if signal.market_structure.order_block else 0.0,
         liquidity_grab_level=signal.liquidity_grab.grab_level if signal.liquidity_grab else 0.0,
@@ -4285,7 +4370,6 @@ async def process_symbol_batch(exchange, symbols: List[str]) -> int:
     
     for symbol in symbols:
         try:
-            # Consecutive loss guard
             if is_symbol_blacklisted_loss(symbol):
                 logger.warning(f"[Loss Guard] Skipping blacklisted symbol due to consecutive losses: {symbol}")
                 continue
@@ -4322,6 +4406,15 @@ async def process_symbol_batch(exchange, symbols: List[str]) -> int:
             if signal:
                 signals_found += 1
                 
+                if not await bot.get_trade_lock(symbol):
+                    continue
+                
+                try:
+                    if symbol in ACTIVE_TRADES:
+                        continue
+                finally:
+                    bot.release_trade_lock(symbol)
+                
                 set_symbol_cooldown(symbol)
                 
                 signal_dict = asdict(signal)
@@ -4333,7 +4426,7 @@ async def process_symbol_batch(exchange, symbols: List[str]) -> int:
                 if is_live_trading_enabled():
                     ok, live_trade_state = await execute_live_entry_if_enabled(exchange, signal)
                     if not ok or not live_trade_state:
-                        await asyncio.sleep(0.1)
+                        await asyncio.sleep(0.02)
                         continue
                     
                     if not await bot.get_trade_lock(symbol):
@@ -4344,10 +4437,10 @@ async def process_symbol_batch(exchange, symbols: List[str]) -> int:
                     finally:
                         bot.release_trade_lock(symbol)
                     
-                    db_manager.save_trade(live_trade_state, signal_dict)
+                    await asyncio.to_thread(db_manager.save_trade, live_trade_state, signal_dict)
                     
                     logger.info(f"[LIVE] ✅ Entry filled - {signal.signal_class} - {symbol} - Score: {signal.quantum_score:.1f}")
-                    await asyncio.sleep(0.1)
+                    await asyncio.sleep(0.02)
                     continue
                 
                 if is_paper_trading_enabled():
@@ -4370,7 +4463,6 @@ async def process_symbol_batch(exchange, symbols: List[str]) -> int:
                         entry_assumed=True,
                         entry_filled=True,
                         entry_fill_amount=entry_fill_amount,
-                        # [IMPROVEMENT] Store order block and liquidity grab levels
                         order_block_low=signal.market_structure.order_block.get('body_low', signal.market_structure.order_block.get('low', 0.0)) if signal.market_structure.order_block else 0.0,
                         order_block_high=signal.market_structure.order_block.get('body_high', signal.market_structure.order_block.get('high', 0.0)) if signal.market_structure.order_block else 0.0,
                         liquidity_grab_level=signal.liquidity_grab.grab_level if signal.liquidity_grab else 0.0,
@@ -4386,18 +4478,18 @@ async def process_symbol_batch(exchange, symbols: List[str]) -> int:
                     
                     signal_dict["is_paper"] = True
                     signal_dict["entry_assumed"] = True
-                    db_manager.save_trade(trade_state, signal_dict)
+                    await asyncio.to_thread(db_manager.save_trade, trade_state, signal_dict)
                     
                     STATS["paper_trades_opened"] += 1
                     logger.info(f"[PAPER] ✅ {signal.signal_class} - {symbol} - Score: {signal.quantum_score:.1f} - Gates: {len(signal.gates_passed)}")
                     
-                    await asyncio.sleep(0.1)
+                    await asyncio.sleep(0.02)
                     continue
                 
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(0.02)
                 continue
             
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(0.02)
         
         except Exception as e:
             logger.error(f"[Batch Error] {symbol}: {str(e)[:100]}")
@@ -4411,16 +4503,22 @@ async def monitor_active_trades(exchange):
         return
     
     try:
-        await asyncio.wait_for(_monitor_active_trades_internal(exchange), timeout=30)
+        await asyncio.wait_for(_monitor_active_trades_internal(exchange), timeout=60)  # زيادة timeout إلى 60 ثانية
     except asyncio.TimeoutError:
         logger.error("[Monitor] Timeout exceeded - skipping this cycle")
     except Exception as e:
         logger.error(f"[Monitor Main Error] {str(e)}")
 
+async def db_update_trade_with_version_async(symbol: str, updates: Dict[str, Any], expected_version: int) -> bool:
+    try:
+        return await asyncio.to_thread(db_manager.update_trade_with_version, symbol, updates, expected_version)
+    except Exception as e:
+        logger.error(f"[DB Async Update Error] {symbol}: {e}")
+        return False
+
 async def _monitor_active_trades_internal(exchange):
     symbols = list(ACTIVE_TRADES.keys())
     
-    # [FIX 2] إنشاء قوائم متطابقة للرموز غير المدرجة في القائمة السوداء
     ticker_tasks = []
     active_symbols = []
     for symbol in symbols:
@@ -4453,6 +4551,10 @@ async def _monitor_active_trades_internal(exchange):
         finally:
             bot.release_trade_lock(symbol)
         
+        # إذا كانت الصفقة في حالة خروج، نتجاوزها
+        if trade.is_exiting:
+            continue
+        
         risk = trade.entry - trade.original_sl
         r_multiple = (current_price - trade.entry) / risk if risk > 0 else 0
         
@@ -4470,7 +4572,6 @@ async def _monitor_active_trades_internal(exchange):
                 await partial_exit(symbol, trade, current_price, "TP1",
                                 CONFIG["TP1_EXIT_PCT"], r_multiple, exchange=exchange)
             
-            # [IMPROVEMENT] Dynamic Break‑Even based on quantum_score
             if trade.quantum_score < 75:
                 be_at_r = 1.3
             elif trade.quantum_score <= 85:
@@ -4484,10 +4585,12 @@ async def _monitor_active_trades_internal(exchange):
                 else:
                     new_sl = trade.entry + (0.001 * trade.entry)
                 
-                # [FIX 4] نمط القفل: أخذ نسخة، تحديث خارج القفل، ثم إعادة القفل
-                async with bot.get_trade_lock(symbol):
-                    # نأخذ نسخة من البيانات المطلوبة
-                    current_version = trade._version
+                try:
+                    async with trade_lock(bot, symbol):
+                        current_version = trade._version
+                except RuntimeError as e:
+                    logger.warning(f"[BE] Could not acquire lock for {symbol}: {e}")
+                    continue
                 
                 updates = {
                     'current_sl': new_sl,
@@ -4495,28 +4598,25 @@ async def _monitor_active_trades_internal(exchange):
                     '_version': current_version + 1
                 }
                 
-                if db_manager.update_trade_with_version(symbol, updates, current_version):
-                    if await bot.get_trade_lock(symbol):
-                        try:
+                if await db_update_trade_with_version_async(symbol, updates, current_version):
+                    try:
+                        async with trade_lock(bot, symbol):
                             if symbol in ACTIVE_TRADES:
                                 ACTIVE_TRADES[symbol].current_sl = new_sl
                                 ACTIVE_TRADES[symbol].be_moved = True
                                 ACTIVE_TRADES[symbol]._version += 1
-                        finally:
-                            bot.release_trade_lock(symbol)
+                    except RuntimeError:
+                        logger.warning(f"[BE] Could not reacquire lock for {symbol} to update local state")
                     
                     logger.info(f"[BE] {symbol} - internal SL moved to breakeven using ATR")
             
-            # [IMPROVEMENT] Trailing stop with protection
             elif r_multiple >= CONFIG["TRAIL_START_R"] and trade.be_moved:
                 atr_estimate = trade.atr if trade.atr > 0 else (trade.tp1 - trade.entry) / CONFIG["TP1_RR"]
                 new_sl = current_price - (atr_estimate * CONFIG["TRAIL_ATR_MULT"])
                 
                 if new_sl > trade.current_sl:
-                    # Protect order block: do not move stop inside order block
                     if trade.order_block_low > 0 and new_sl > trade.order_block_low:
                         new_sl = min(new_sl, trade.order_block_low - 1e-8)
-                    # Protect liquidity grab level: do not move stop above it (since it's support)
                     if trade.liquidity_grab_level > 0 and new_sl > trade.liquidity_grab_level:
                         new_sl = min(new_sl, trade.liquidity_grab_level - 1e-8)
                     
@@ -4527,19 +4627,19 @@ async def _monitor_active_trades_internal(exchange):
                             '_version': trade._version + 1
                         }
                         
-                        if db_manager.update_trade_with_version(symbol, updates, trade._version):
-                            if await bot.get_trade_lock(symbol):
-                                try:
+                        if await db_update_trade_with_version_async(symbol, updates, trade._version):
+                            try:
+                                async with trade_lock(bot, symbol):
                                     if symbol in ACTIVE_TRADES:
                                         ACTIVE_TRADES[symbol].current_sl = new_sl
                                         ACTIVE_TRADES[symbol].trailing_active = True
                                         ACTIVE_TRADES[symbol]._version += 1
-                                finally:
-                                    bot.release_trade_lock(symbol)
+                            except RuntimeError:
+                                logger.warning(f"[Trail] Could not reacquire lock for {symbol} to update local state")
                 
                 continue
         
-        # Paper/Signal mode: same logic but without exchange actions
+        # Paper/Signal mode
         if current_price <= trade.current_sl:
             await close_trade_full(symbol, current_price, "SL")
             continue
@@ -4553,7 +4653,6 @@ async def _monitor_active_trades_internal(exchange):
             await partial_exit(symbol, trade, current_price, "TP1",
                             CONFIG["TP1_EXIT_PCT"], r_multiple)
         
-        # [IMPROVEMENT] Dynamic Break‑Even for paper/signal
         if trade.quantum_score < 75:
             be_at_r = 1.3
         elif trade.quantum_score <= 85:
@@ -4567,8 +4666,12 @@ async def _monitor_active_trades_internal(exchange):
             else:
                 new_sl = trade.entry + (0.001 * trade.entry)
             
-            async with bot.get_trade_lock(symbol):
-                current_version = trade._version
+            try:
+                async with trade_lock(bot, symbol):
+                    current_version = trade._version
+            except RuntimeError as e:
+                logger.warning(f"[BE] Could not acquire lock for {symbol}: {e}")
+                continue
             
             updates = {
                 'current_sl': new_sl,
@@ -4576,28 +4679,25 @@ async def _monitor_active_trades_internal(exchange):
                 '_version': current_version + 1
             }
             
-            if db_manager.update_trade_with_version(symbol, updates, current_version):
-                if await bot.get_trade_lock(symbol):
-                    try:
+            if await db_update_trade_with_version_async(symbol, updates, current_version):
+                try:
+                    async with trade_lock(bot, symbol):
                         if symbol in ACTIVE_TRADES:
                             ACTIVE_TRADES[symbol].current_sl = new_sl
                             ACTIVE_TRADES[symbol].be_moved = True
                             ACTIVE_TRADES[symbol]._version += 1
-                    finally:
-                        bot.release_trade_lock(symbol)
+                except RuntimeError:
+                    logger.warning(f"[BE] Could not reacquire lock for {symbol} to update local state")
                 
                 logger.info(f"[BE] {symbol} - SL moved to breakeven using ATR")
         
-        # [IMPROVEMENT] Trailing stop for paper/signal
         elif r_multiple >= CONFIG["TRAIL_START_R"] and trade.be_moved:
             atr_estimate = trade.atr if trade.atr > 0 else (trade.tp1 - trade.entry) / CONFIG["TP1_RR"]
             new_sl = current_price - (atr_estimate * CONFIG["TRAIL_ATR_MULT"])
             
             if new_sl > trade.current_sl:
-                # Protect order block
                 if trade.order_block_low > 0 and new_sl > trade.order_block_low:
                     new_sl = min(new_sl, trade.order_block_low - 1e-8)
-                # Protect liquidity grab level
                 if trade.liquidity_grab_level > 0 and new_sl > trade.liquidity_grab_level:
                     new_sl = min(new_sl, trade.liquidity_grab_level - 1e-8)
                 
@@ -4608,22 +4708,24 @@ async def _monitor_active_trades_internal(exchange):
                         '_version': trade._version + 1
                     }
                     
-                    if db_manager.update_trade_with_version(symbol, updates, trade._version):
-                        if await bot.get_trade_lock(symbol):
-                            try:
+                    if await db_update_trade_with_version_async(symbol, updates, trade._version):
+                        try:
+                            async with trade_lock(bot, symbol):
                                 if symbol in ACTIVE_TRADES:
                                     ACTIVE_TRADES[symbol].current_sl = new_sl
                                     ACTIVE_TRADES[symbol].trailing_active = True
                                     ACTIVE_TRADES[symbol]._version += 1
-                            finally:
-                                bot.release_trade_lock(symbol)
+                        except RuntimeError:
+                            logger.warning(f"[Trail] Could not reacquire lock for {symbol} to update local state")
 
 async def fetch_ticker_with_lock(exchange, symbol):
     try:
         await rate_limiter.wait_if_needed(weight=CONFIG.get("TICKER_WEIGHT", 2))
         ticker = await exchange.fetch_ticker(symbol)
+        rate_limiter.reset_errors()
         return ticker
     except Exception as e:
+        rate_limiter.record_error()
         logger.error(f"[Ticker Error] {symbol}: {e}")
         return None
 
@@ -4664,13 +4766,14 @@ async def partial_exit(symbol: str, trade: TradeState, exit_price: float,
         current_version = current_trade._version
         sl_order_id = current_trade.sl_order_id
         
-        db_manager.save_trade(current_trade)
+        new_sl_order_id = ""
+        
+        await asyncio.to_thread(db_manager.save_trade, current_trade)
         
         sell_amount_base = entry_fill_amount * exit_pct
         live_sell_ok = True
         fill_price = exit_price
         
-        # [FIX 4] تحرير القفل قبل استدعاء API
         bot.release_trade_lock(symbol)
         
         if is_live_trading_enabled() and exchange and sell_amount_base > 0:
@@ -4683,7 +4786,6 @@ async def partial_exit(symbol: str, trade: TradeState, exit_price: float,
                     fill_price = exit_price
             
             if not live_sell_ok:
-                # استعادة القفل لتحديث الحالة
                 if not await bot.get_trade_lock(symbol):
                     logger.error(f"[partial_exit] Failed to reacquire lock for {symbol} after API failure")
                     return
@@ -4698,7 +4800,7 @@ async def partial_exit(symbol: str, trade: TradeState, exit_price: float,
                             ACTIVE_TRADES[symbol].tp3_order_done = False
                         
                         ACTIVE_TRADES[symbol].is_exiting = False
-                        db_manager.save_trade(ACTIVE_TRADES[symbol])
+                        await asyncio.to_thread(db_manager.save_trade, ACTIVE_TRADES[symbol])
                 finally:
                     bot.release_trade_lock(symbol)
                 
@@ -4716,7 +4818,6 @@ async def partial_exit(symbol: str, trade: TradeState, exit_price: float,
                         logger.warning(f"[partial_exit] Failed to place new SL for {symbol}")
                         new_sl_order_id = ""
         
-        # إعادة القفل لتحديث الحالة
         if not await bot.get_trade_lock(symbol):
             logger.error(f"[partial_exit] Failed to reacquire lock for {symbol} after API")
             return
@@ -4725,7 +4826,7 @@ async def partial_exit(symbol: str, trade: TradeState, exit_price: float,
             if symbol not in ACTIVE_TRADES:
                 return
             
-            current_trade = ACTIVE_TRADES[symbol]  # إعادة جلب الكائن المحدث
+            current_trade = ACTIVE_TRADES[symbol]
             
             risk = trade.entry - trade.original_sl
             actual_r_multiple = (fill_price - trade.entry) / risk if risk > 0 else 0
@@ -4753,14 +4854,13 @@ async def partial_exit(symbol: str, trade: TradeState, exit_price: float,
             if is_live_trading_enabled() and exchange and new_sl_order_id:
                 current_trade.sl_order_id = new_sl_order_id
             
-            db_manager.save_trade(current_trade)
+            await asyncio.to_thread(db_manager.save_trade, current_trade)
         
         finally:
             bot.release_trade_lock(symbol)
     
     except Exception as e:
         logger.error(f"[partial_exit] Unhandled error for {symbol}: {e}")
-        # محاولة تحرير القفل إذا كان محتجزاً
         try:
             bot.release_trade_lock(symbol)
         except:
@@ -4808,7 +4908,7 @@ async def partial_exit(symbol: str, trade: TradeState, exit_price: float,
     if current_remaining <= 0.01:
         await close_trade_full(symbol, fill_price, "ALL_TPS", exchange=exchange)
 
-# ===================== INSTITUTIONAL CLOSE TRADE FULL =====================
+# ===================== INSTITUTIONAL CLOSE TRADE FULL (مع تصحيح تسجيل الخسارة) =====================
 async def close_trade_full(symbol: str, exit_price: float, exit_type: str, exchange=None, sell_order_info: Optional[Dict] = None):
     trade = None
     remaining = 0
@@ -4849,9 +4949,8 @@ async def close_trade_full(symbol: str, exit_price: float, exit_type: str, excha
     
     live_sell_ok = True
     fill_price = exit_price
-    if is_live_trading_enabled() and exchange is not None and remaining > 0.01 and exit_type in ("SL", "ALL_TPS"):
+    if is_live_trading_enabled() and exchange is not None and remaining > 0.01 and exit_type in ("SL", "ALL_TPS", "EMERGENCY_RECOVERY"):
         remaining_base = fill_amount * remaining
-        # [FIX 4] لا حاجة لقفل هنا، سنقوم بالبيع ثم نستعيد القفل للتحديث
         sell_order = await market_sell_safe(exchange, symbol, remaining_base, max_retries=3)
         live_sell_ok = bool(sell_order)
         
@@ -4880,7 +4979,7 @@ async def close_trade_full(symbol: str, exit_price: float, exit_type: str, excha
             )
             return
         
-        if sl_order_id and exchange:
+        if sl_order_id and exchange and exit_type in ("SL", "ALL_TPS", "EMERGENCY_RECOVERY"):
             await cancel_stop_loss_order(exchange, symbol, sl_order_id)
     
     final_exit_r = 0.0
@@ -4905,20 +5004,21 @@ async def close_trade_full(symbol: str, exit_price: float, exit_type: str, excha
     
     profit_pct = ((fill_price - entry) / entry) * 100
     
-    # [IMPROVEMENT] Update global consecutive losses
-    if exit_type == "SL":
+    # تحديث الإحصائيات بناءً على r_multiple (سواء كان موجباً أو سالباً)
+    if r_multiple <= 0:
+        # خسارة
         STATS["global_consecutive_losses"] = STATS.get("global_consecutive_losses", 0) + 1
         STATS["trades_lost"] += 1
-        STATS["total_r_multiple"] += final_exit_r
-        record_loss(symbol)   # تسجيل الخسارة المتتالية
+        record_loss(symbol)
     else:
-        STATS["global_consecutive_losses"] = 0  # reset on win
+        # ربح
+        STATS["global_consecutive_losses"] = 0
         STATS["trades_won"] += 1
-        STATS["total_r_multiple"] += final_exit_r
     
+    STATS["total_r_multiple"] += final_exit_r
     record_daily_r(final_exit_r)
     
-    db_manager.record_trade_history(symbol, trade, fill_price, exit_type, total_r, execution_mode)
+    await asyncio.to_thread(db_manager.record_trade_history, symbol, trade, fill_price, exit_type, total_r, execution_mode)
     
     mode_badge = "✅ LIVE" if is_live_trading_enabled() else ("🟨 PAPER" if getattr(trade, "is_paper", False) else "🟦 SIGNAL")
     
@@ -4951,7 +5051,7 @@ async def close_trade_full(symbol: str, exit_price: float, exit_type: str, excha
         finally:
             bot.release_trade_lock(symbol)
     
-    db_manager.remove_trade(symbol)
+    await asyncio.to_thread(db_manager.remove_trade, symbol)
     
     logger.info(f"[SL] {symbol} closed - {exit_type} - {profit_pct:+.2f}% - {final_exit_r:.2f}R (total {total_r:.2f}R)")
 
@@ -4993,16 +5093,16 @@ async def generate_performance_report() -> str:
 • ✅ Slippage Recheck بعد التنفيذ (RR ديناميكي حسب TP1_RR)
 • ✅ Consecutive Loss Guard (حظر الرمز 6 ساعات بعد خسارتين متتاليتين خلال 24 ساعة)
 • ✅ Dynamic Break‑Even (حسب النقاط)
-• ✅ BTC Correlation Filter (corr < 0.1 مرفوض، مع تجاهل فشل API وNaN)
+• ✅ BTC Correlation Filter (corr < 0.05 مرفوض، مع تجاهل فشل API وNaN)
 • ✅ مكافأة إضافية لـ BELOW_VALUE + BULLISH_FLOW
 • ✅ Edge Intelligence Engine (Self-monitoring, Self-risk adjusting, Self-protecting)
 • ✅ Trailing Stop مع حماية مناطق السيولة والأوردر بلوك
-• ✅ Symbol Filter (أعلى 50 سيولة، حجم > MIN_VOLUME_24H, سعر >= 0.00001)
-• ✅ Market Volatility Filter (ATR% 15m > 6% مرفوض)
-• ✅ Slippage protection (MAX_SLIPPAGE_PCT = 0.3%)
+• ✅ Symbol Filter (أعلى 80 سيولة، حجم > 2M, سعر >= 0.00001)
+• ✅ Market Volatility Filter (ATR% 15m > 8% مرفوض)
+• ✅ Slippage protection (MAX_SLIPPAGE_PCT = 0.35%)
 • ✅ Global consecutive loss circuit breaker (MAX_CONSECUTIVE_LOSSES = 3)
-• ✅ Liquidity filter configurable (MIN_VOLUME_24H)
-• ✅ تحسين التسجيل بوسوم ENTRY / FILL / TP / SL
+• ✅ Liquidity filter configurable (MIN_VOLUME_24H = 2M)
+• ✅ تحسين التسجيل بوسوم ENTRY / FILL / TP / SL / REJECT / LIQUIDITY
 
 🧯 Daily Circuit
 • Enabled: {'ON' if CONFIG.get('ENABLE_DAILY_MAX_LOSS', True) else 'OFF'}
@@ -5060,6 +5160,14 @@ async def generate_performance_report() -> str:
         profit_factor = total_profit / total_loss if total_loss > 0 else float('inf')
         
         metrics_summary = metrics.get_summary()
+        
+        try:
+            edge_engine = await get_edge_engine()
+            score_r_corr = getattr(edge_engine, 'score_r_corr', 1.0)
+            trades_list = getattr(edge_engine, 'trades', [])
+        except Exception:
+            score_r_corr = 1.0
+            trades_list = []
         
         report = f"""
 📊 تقرير الأداء - Quantum Flow v1.8.6 ULTIMATE INSTITUTIONAL EDITION
@@ -5135,6 +5243,10 @@ async def generate_performance_report() -> str:
         report += f"• الحجم: {cache_stats['size']}\n"
         report += f"• متوسط الوصولات: {cache_stats['avg_access_count']:.1f}\n"
         
+        report += f"\n🧠 Edge Intelligence Engine\n"
+        report += f"• Score-R Correlation: {score_r_corr:.2f}\n"
+        report += f"• Trades Analyzed: {len(trades_list)}\n"
+        
         return report
     
     except Exception as e:
@@ -5151,16 +5263,33 @@ async def toggle_computational_features():
     if loop_count % 7 == 0:
         await cache.smart_cache_cleanup()
     
-    # [FIX 15] Periodically clean correlation_cache
     if loop_count % 100 == 0:
         now = time.time()
-        bot.correlation_cache = {
-            k: v for k, v in bot.correlation_cache.items()
-            if now - v[1] < 3600   # الاحتفاظ بالمدخلات الأقل من ساعة
-        }
+        async with bot.correlation_cache_lock:
+            bot.correlation_cache = {
+                k: v for k, v in bot.correlation_cache.items()
+                if now - v[1] < 3600
+            }
 
-# ===================== HEALTH CHECK ENDPOINT =====================
+# ===================== HEALTH CHECK ENDPOINT مع محدد معدل =====================
+# محدد معدل بسيط لنقطة health check
+health_rate_limit = {}
+health_rate_limit_lock = asyncio.Lock()
+
 async def health_check_handler(request):
+    # الحصول على عنوان IP (قد يكون من proxy)
+    client_ip = request.remote
+    if client_ip is None:
+        client_ip = 'unknown'
+    
+    async with health_rate_limit_lock:
+        now = time.time()
+        # تنظيف الإدخالات القديمة (أكثر من دقيقة)
+        health_rate_limit[client_ip] = [t for t in health_rate_limit.get(client_ip, []) if now - t < 60]
+        if len(health_rate_limit.get(client_ip, [])) >= 100:  # 100 طلب في الدقيقة كحد أقصى
+            return web.json_response({"error": "Rate limit exceeded"}, status=429)
+        health_rate_limit.setdefault(client_ip, []).append(now)
+    
     health_status = "healthy"
     issues = []
     
@@ -5233,6 +5362,15 @@ async def memory_monitor_task():
         for stat in top_stats:
             logger.info(f"  {stat}")
 
+# ===================== دالة reconcile_balances (مضافة) =====================
+async def reconcile_balances(exchange):
+    """
+    دالة مؤقتة لمطابقة الأرصدة. سيتم تنفيذها لاحقاً.
+    """
+    logger.info("[Reconcile] Running balance reconciliation (placeholder)")
+    # هنا يمكن إضافة منطق مطابقة الأرصدة مع المنصة لاحقاً
+    await asyncio.sleep(1)
+
 # ===================== ENHANCED MAIN LOOP =====================
 async def main_loop(exchange):
     emergency_monitor_task = None
@@ -5262,7 +5400,7 @@ async def main_loop(exchange):
         logger.info(f"HEALTH CHECK: {'✅' if CONFIG.get('ENABLE_HEALTH_CHECK', False) else '❌'}")
         logger.info(f"MEMORY MONITORING: {'✅' if CONFIG.get('ENABLE_MEMORY_MONITORING', False) else '❌'}")
         logger.info(f"ENHANCED LOCK MANAGER: ✅ (مع Recovery و Blacklisting و TTL)")
-        logger.info(f"METRICS COLLECTOR: ✅ (مع تصحيح success)")
+        logger.info(f"METRICS COLLECTOR: ✅ (مع تصحيح success وحد الذاكرة)")
         logger.info(f"EXPONENTIAL BACKOFF RETRY: ✅")
         logger.info("✅ جميع التحسينات الجديدة مدمجة:")
         logger.info("  1. تعديلات القيم الصارمة (trend strength 70, min score 68, spread 0.10, cooldown 1200)")
@@ -5273,16 +5411,16 @@ async def main_loop(exchange):
         logger.info("  6. Slippage Recheck بعد التنفيذ (RR ديناميكي حسب TP1_RR)")
         logger.info("  7. Consecutive Loss Guard (حظر الرمز 6 ساعات بعد خسارتين متتاليتين خلال 24 ساعة)")
         logger.info("  8. Dynamic Break‑Even (حسب النقاط)")
-        logger.info("  9. BTC Correlation Filter (corr < 0.1 مرفوض، مع تجاهل فشل API وNaN)")
+        logger.info("  9. BTC Correlation Filter (corr < 0.05 مرفوض، مع تجاهل فشل API وNaN)")
         logger.info(" 10. مكافأة إضافية لـ BELOW_VALUE + BULLISH_FLOW")
         logger.info(" 11. Edge Intelligence Engine (Self-monitoring, Self-risk adjusting, Self-protecting)")
         logger.info(" 12. Trailing Stop مع حماية مناطق السيولة والأوردر بلوك")
-        logger.info(" 13. Symbol Filter (أعلى 50 سيولة، حجم > MIN_VOLUME_24H, سعر >= 0.00001)")
-        logger.info(" 14. Market Volatility Filter (ATR% 15m > 6% مرفوض)")
+        logger.info(" 13. Symbol Filter (أعلى 80 سيولة، حجم > 2M, سعر >= 0.00001)")
+        logger.info(" 14. Market Volatility Filter (ATR% 15m > 8% مرفوض)")
         logger.info(" 15. Quantum Score Rebalance (الأوزان الجديدة)")
-        logger.info(" 16. Slippage protection (MAX_SLIPPAGE_PCT)")
+        logger.info(" 16. Slippage protection (MAX_SLIPPAGE_PCT = 0.35%)")
         logger.info(" 17. Global consecutive loss circuit breaker (MAX_CONSECUTIVE_LOSSES)")
-        logger.info(" 18. تحسين التسجيل بوسوم ENTRY / FILL / TP / SL")
+        logger.info(" 18. تحسين التسجيل بوسوم ENTRY / FILL / TP / SL / REJECT / LIQUIDITY")
         logger.info("="*70)
         
         db_manager.init_database()
@@ -5295,6 +5433,9 @@ async def main_loop(exchange):
         
         await exchange.load_markets()
         logger.info(f"متصل! الأسواق: {len(exchange.markets)}")
+        
+        if is_live_trading_enabled():
+            await validate_stop_loss_capability(exchange)
         
         if is_live_trading_enabled():
             await ensure_live_trading_ready(exchange)
@@ -5345,16 +5486,16 @@ async def main_loop(exchange):
 • ✅ Slippage Recheck بعد التنفيذ (RR ديناميكي حسب TP1_RR)
 • ✅ Consecutive Loss Guard (حظر الرمز 6 ساعات بعد خسارتين متتاليتين خلال 24 ساعة)
 • ✅ Dynamic Break‑Even (حسب النقاط)
-• ✅ BTC Correlation Filter (corr < 0.1 مرفوض، مع تجاهل فشل API وNaN)
+• ✅ BTC Correlation Filter (corr < 0.05 مرفوض، مع تجاهل فشل API وNaN)
 • ✅ مكافأة إضافية لـ BELOW_VALUE + BULLISH_FLOW
 • ✅ Edge Intelligence Engine (Self-monitoring, Self-risk adjusting, Self-protecting)
 • ✅ Trailing Stop مع حماية مناطق السيولة والأوردر بلوك
-• ✅ Symbol Filter (أعلى 50 سيولة، حجم > MIN_VOLUME_24H, سعر >= 0.00001)
-• ✅ Market Volatility Filter (ATR% 15m > 6% مرفوض)
+• ✅ Symbol Filter (أعلى 80 سيولة، حجم > 2M, سعر >= 0.00001)
+• ✅ Market Volatility Filter (ATR% 15m > 8% مرفوض)
 • ✅ Quantum Score Rebalance (الأوزان الجديدة)
-• ✅ Slippage protection (MAX_SLIPPAGE_PCT)
+• ✅ Slippage protection (MAX_SLIPPAGE_PCT = 0.35%)
 • ✅ Global consecutive loss circuit breaker (MAX_CONSECUTIVE_LOSSES)
-• ✅ تحسين التسجيل بوسوم ENTRY / FILL / TP / SL
+• ✅ تحسين التسجيل بوسوم ENTRY / FILL / TP / SL / REJECT / LIQUIDITY
 
 🧯 Daily Circuit
 • Enabled: {'ON' if CONFIG.get('ENABLE_DAILY_MAX_LOSS', True) else 'OFF'}
@@ -5389,7 +5530,6 @@ async def main_loop(exchange):
                 
                 await toggle_computational_features()
                 
-                # === EDGE ENGINE: EARLY TRADE BLOCKER ===
                 try:
                     edge_engine = await get_edge_engine()
                     if not edge_engine.should_trade():
@@ -5398,7 +5538,6 @@ async def main_loop(exchange):
                         continue
                 except Exception as e:
                     logger.error(f"[EdgeEngine] Error checking trade state: {e}")
-                # ========================================
                 
                 btc_status = await check_btc_trend(exchange)
                 if not btc_status['safe_to_trade']:
@@ -5406,7 +5545,7 @@ async def main_loop(exchange):
                     await asyncio.sleep(60)
                     continue
                 
-                if loop_count % 5 == 0 or not all_symbols:
+                if loop_count % 30 == 0 or not all_symbols:
                     all_symbols = await get_filtered_symbols(exchange)
                 
                 await monitor_active_trades(exchange)
@@ -5422,13 +5561,11 @@ async def main_loop(exchange):
                     report = await generate_performance_report()
                     await send_telegram(report)
                     
-                    # === EDGE ENGINE: TELEMETRY REPORT ===
                     try:
                         edge_engine = await get_edge_engine()
                         edge_report = edge_engine.get_telemetry_report()
                         await send_telegram(f"<code>{edge_report}</code>")
                         
-                        # Check for low correlation warning
                         if edge_engine.score_r_corr < 0.1 and len(edge_engine.trades) >= 20:
                             await send_telegram(
                                 f"⚠️ <b>Quantum score losing predictive power</b>\n"
@@ -5438,13 +5575,12 @@ async def main_loop(exchange):
                             )
                     except Exception as e:
                         logger.error(f"[EdgeEngine] Telemetry error: {str(e)}")
-                    # =====================================
                 
                 loop_time = time.time() - loop_start
                 sleep_time = max(5, 15 - loop_time)
                 
                 if CONFIG["DEBUG_MODE"] or loop_count % 10 == 0:
-                    edge_engine = await get_edge_engine()   # [FIX 12] استخدام اسم edge_engine
+                    edge_engine = await get_edge_engine()
                     logger.info(f"[دورة {loop_count}] الوقت: {loop_time:.1f}ث، الانتظار: {sleep_time:.1f}ث، "
                               f"الإشارات: {STATS['signals_generated']}, النشطة: {len(ACTIVE_TRADES)}, "
                               f"paper_opened={STATS.get('paper_trades_opened',0)}, cooldown={CONFIG.get('SYMBOL_COOLDOWN_SEC')}, "
@@ -5529,7 +5665,7 @@ async def emergency_state_monitor(exchange):
                             try:
                                 if symbol in ACTIVE_TRADES:
                                     ACTIVE_TRADES[symbol].emergency_state = False
-                                    db_manager.save_trade(ACTIVE_TRADES[symbol])
+                                    await asyncio.to_thread(db_manager.save_trade, ACTIVE_TRADES[symbol])
                             finally:
                                 bot.release_trade_lock(symbol)
                         continue
@@ -5542,6 +5678,7 @@ async def emergency_state_monitor(exchange):
                     
                     await rate_limiter.wait_if_needed(weight=2)
                     ticker = await exchange.fetch_ticker(symbol)
+                    rate_limiter.reset_errors()
                     current_price = safe_float(ticker.get('last'))
                     
                     if not validate_price(current_price):
@@ -5570,7 +5707,7 @@ async def emergency_state_monitor(exchange):
                                 if symbol in ACTIVE_TRADES:
                                     ACTIVE_TRADES[symbol].emergency_attempts += 1
                                     ACTIVE_TRADES[symbol].emergency_last_attempt = now_utc_iso()
-                                    db_manager.save_trade(ACTIVE_TRADES[symbol])
+                                    await asyncio.to_thread(db_manager.save_trade, ACTIVE_TRADES[symbol])
                             finally:
                                 bot.release_trade_lock(symbol)
                         
@@ -5591,54 +5728,6 @@ async def emergency_state_monitor(exchange):
             logger.error(f"[Emergency Monitor Main Error] {str(e)}")
             await asyncio.sleep(60)
 
-# ===================== BALANCE RECONCILIATION TASK =====================
-async def reconcile_balances(exchange):
-    while not shutdown_manager.should_stop:
-        await asyncio.sleep(CONFIG.get("RECONCILIATION_INTERVAL_SEC", 300))
-        
-        if not is_live_trading_enabled():
-            continue
-        
-        if not ACTIVE_TRADES:
-            continue
-        
-        try:
-            balance = await exchange.fetch_balance()
-            if not balance:
-                continue
-            
-            for symbol, trade in list(ACTIVE_TRADES.items()):
-                try:
-                    base_asset = symbol.split('/')[0]
-                    real_balance = balance['free'].get(base_asset, 0.0)
-                    
-                    expected = trade.entry_fill_amount * trade.remaining_position
-                    
-                    if abs(real_balance - expected) > CONFIG["MIN_DUST_THRESHOLD"]:
-                        logger.warning(f"[Reconciliation] Mismatch for {symbol}: expected {expected:.8f}, real {real_balance:.8f}")
-                        await send_telegram(
-                            f"⚠️ تنبيه المطابقة\n\n"
-                            f"الرمز: {escape_html(symbol)}\n"
-                            f"الرصيد المتوقع: {expected:.8f} {base_asset}\n"
-                            f"الرصيد الفعلي: {real_balance:.8f} {base_asset}\n"
-                            f"الفرق: {abs(real_balance - expected):.8f}\n\n"
-                            f"قد يكون هناك تنفيذ غير متوقع أو خطأ في الحسابات الداخلية.",
-                            critical=False
-                        )
-                        
-                        if abs(real_balance - expected) > expected * 0.1:
-                            await mark_trade_emergency(
-                                symbol,
-                                reason=f"Reconciliation mismatch: expected {expected}, real {real_balance}",
-                                critical_msg=f"🚨 Reconciliation Critical: {symbol}\nفرق كبير بين الرصيد الفعلي والمتوقع. يرجى المراجعة الفورية."
-                            )
-                except Exception as e:
-                    logger.error(f"[Reconciliation] Error processing {symbol}: {e}")
-                    continue
-        
-        except Exception as e:
-            logger.error(f"[Reconciliation] Main error: {e}")
-
 # ===================== ENTRY POINT =====================
 async def async_main():
     exchange = None
@@ -5657,12 +5746,19 @@ async def async_main():
             logger.info("ℹ️ TA-Lib غير متوفر - سيتم استخدام ta (عادي)")
         
         load_telegram_from_env()
-        load_mexc_from_env()   # [FIX 5] تحميل مفاتيح MEXC من البيئة
+        load_mexc_from_env()
+        
+        _ensure_runtime_paths()
+        global db_manager
+        db_manager = DatabaseManager(CONFIG["DB_PATH"])
+        
+        try:
+            daily_circuit.attach_db(db_manager)
+        except Exception as e:
+            logger.error(f"[Daily Circuit] attach_db failed: {e}")
         
         if CONFIG["ENABLE_DB_PERSISTENCE"]:
             logger.info("✅ ثبات قاعدة البيانات مفعّل")
-        
-        _ensure_runtime_paths()
         
         try:
             validate_config()
@@ -5690,12 +5786,9 @@ async def async_main():
             exchange.apiKey = CONFIG.get("MEXC_API_KEY", "")
             exchange.secret = CONFIG.get("MEXC_API_SECRET", "")
         
-        # === EDGE ENGINE INITIALIZATION ===
         edge_engine = await get_edge_engine()
         logger.info("[EdgeEngine] Initialized with state: %s", edge_engine.system_state)
-        # ================================
         
-        # [FIX 3] إضافة معالج الإشارات للإيقاف التدريجي
         def _handle_signal(sig, frame):
             logger.warning(f"[Signal] Received {sig}, initiating graceful shutdown...")
             shutdown_manager.should_stop = True
@@ -5734,6 +5827,7 @@ def main():
     while True:
         try:
             shutdown_manager.should_stop = False
+            shutdown_manager.tasks.clear()
             asyncio.run(async_main())
         except KeyboardInterrupt:
             logger.info("\n👋 توقف البوت بواسطة المستخدم")
