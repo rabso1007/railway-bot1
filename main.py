@@ -14,6 +14,14 @@ QUANTUM FLOW TRADING BOT v1.8.9 - ULTIMATE INSTITUTIONAL EDITION WITH EDGE INTEL
 - إزالة حلقة إعادة التشغيل من main() والاعتماد على معالجة الأخطاء داخل async_main
 - تحسين فلتر BTC بنظام الحالات (CRASH, WEAK, OK) مع السماح فقط بإشارات A+ في حالة WEAK
 - إضافة تسجيل تفصيلي لأسباب رفض BTC وإحصائيات الرفض
+- إضافة دالة get_edge_engine_cached لتقليل الاستدعاءات المتكررة
+- تحسين اتصال aiohttp في get_session مع resolver و keepalive
+- إصلاح partial_exit لمنع بقاء is_exiting=True
+- إصلاح apply_be_and_trail بعدم إرسال _version للتحديث
+- إصلاح close_trade_full لحساب r_multiple بعد السعر الفعلي
+- تسجيل الخسائر في daily circuit عبر record_daily_r
+- إصلاح check_btc_conditions لمنطق WEAK/OK
+- إضافة الأعمدة المفقودة في calculate_indicators عند استخدام TA-Lib
 """
 
 import asyncio
@@ -278,17 +286,17 @@ class EnhancedLockManager:
     def is_blacklisted(self, symbol: str) -> bool:
         # هذه دالة متزامنة (لا تستخدم async with)
         now = time.time()
-        if symbol not in self.failed_locks:
+        data = self.failed_locks.get(symbol)
+        if not data:
             return False
-        # TTL check
-        if now - self.failed_locks[symbol]['last_failure'] > self.BLACKLIST_TTL:
-            # Auto-expire - but we need to modify dict, so we need lock? but this is sync function.
-            # Better to move expiry to a background task, but for simplicity we'll just return False
-            # and let the expiry happen in the next acquire attempt.
-            # Actually we can't modify safely without lock, so we return False and ignore.
-            # The acquire_trade_lock will eventually remove it on success.
+        # TTL expiry
+        if now - data.get('last_failure', 0) > self.BLACKLIST_TTL:
+            try:
+                del self.failed_locks[symbol]
+            except KeyError:
+                pass
             return False
-        return self.failed_locks[symbol]['count'] >= 3
+        return data.get('count', 0) >= 3
 
     async def acquire_all_locks(self):
         acquired = []
@@ -1254,7 +1262,7 @@ class SmartCache:
 
 cache = SmartCache()
 
-# ===================== ENHANCED HTTP SESSION =====================
+# ===================== ENHANCED HTTP SESSION (مع تحسينات Railway) =====================
 async def get_session() -> aiohttp.ClientSession:
     global HTTP_SESSION
     async with _http_session_lock:
@@ -1265,11 +1273,17 @@ async def get_session() -> aiohttp.ClientSession:
                 sock_read=15,
                 sock_connect=10
             )
+            try:
+                resolver = aiohttp.AsyncResolver()
+            except Exception:
+                resolver = None
             connector = aiohttp.TCPConnector(
                 limit=100,
                 limit_per_host=30,
                 ttl_dns_cache=300,
-                enable_cleanup_closed=True
+                enable_cleanup_closed=True,
+                keepalive_timeout=30,
+                resolver=resolver
             )
             HTTP_SESSION = aiohttp.ClientSession(
                 timeout=timeout,
@@ -2222,7 +2236,16 @@ async def save_emergency_checkpoint_async(err: Exception):
 def save_emergency_checkpoint(err: Exception):
     asyncio.create_task(save_emergency_checkpoint_async(err))
 
-# ===================== INDICATORS (مع إصلاح TALIB_FALLBACK) =====================
+# ===================== دالة مؤقتة لـ Edge Engine Caching =====================
+async def get_edge_engine_cached():
+    """
+    استخدام نفس instance من EdgeEngine لتقليل await/get المتكرر
+    """
+    if getattr(bot, "edge_engine", None) is None:
+        bot.edge_engine = await get_edge_engine()
+    return bot.edge_engine
+
+# ===================== INDICATORS (مع إصلاح TALIB_FALLBACK وإضافة الأعمدة المفقودة) =====================
 def calculate_indicators(df: pd.DataFrame) -> Optional[pd.DataFrame]:
     if df is None or len(df) < 20:
         return None
@@ -2248,6 +2271,19 @@ def calculate_indicators(df: pd.DataFrame) -> Optional[pd.DataFrame]:
                 df['rsi'] = df['rsi'].fillna(50)
                 macd, macdsignal, macdhist = talib.MACD(closes, fastperiod=12, slowperiod=26, signalperiod=9)
                 df['macd'] = pd.Series(macdhist, index=df.index).fillna(0)
+                # إضافة الأعمدة المفقودة (adx, bb_width, volume_ratio)
+                df['adx'] = talib.ADX(highs, lows, closes, timeperiod=14)
+                df['adx'] = df['adx'].fillna(25)
+                # Bollinger Bands
+                upper, middle, lower = talib.BBANDS(closes, timeperiod=20, nbdevup=2, nbdevdn=2)
+                df['bb_upper'] = upper
+                df['bb_lower'] = lower
+                df['bb_width'] = (df['bb_upper'] - df['bb_lower']) / df['close'].replace(0, np.nan)
+                df['bb_width'] = df['bb_width'].fillna(0)
+                # Volume SMA and ratio
+                df['volume_sma'] = talib.SMA(df['volume'], timeperiod=20)
+                df['volume_ratio'] = df['volume'] / df['volume_sma'].replace(0, np.nan)
+                df['volume_ratio'] = df['volume_ratio'].fillna(1)
             except Exception:
                 TALIB_FALLBACK = True
 
@@ -2285,6 +2321,11 @@ def calculate_indicators(df: pd.DataFrame) -> Optional[pd.DataFrame]:
                 df['macd'] = df['macd'].fillna(0)
             else:
                 df['macd'] = 0
+            if len(df) >= 14:
+                df['adx'] = ta.trend.adx(df['high'], df['low'], df['close'], 14)
+                df['adx'] = df['adx'].fillna(25)
+            else:
+                df['adx'] = 25
             if len(df) >= 20:
                 df['volume_sma'] = df['volume'].rolling(20).mean()
                 df['volume_ratio'] = df['volume'] / df['volume_sma'].replace(0, np.nan)
@@ -2302,11 +2343,6 @@ def calculate_indicators(df: pd.DataFrame) -> Optional[pd.DataFrame]:
                 df['bb_upper'] = df['close']
                 df['bb_lower'] = df['close']
                 df['bb_width'] = 0
-            if len(df) >= 14:
-                df['adx'] = ta.trend.adx(df['high'], df['low'], df['close'], 14)
-                df['adx'] = df['adx'].fillna(25)
-            else:
-                df['adx'] = 25
 
         df = df.ffill().bfill()
         for col in df.columns:
@@ -3045,7 +3081,7 @@ async def calculate_position_size(entry: float, sl: float, account_size: Optiona
         risk_pct = 1.7
     base_risk_amount = account_size * (risk_pct / 100)
     try:
-        edge_engine = await get_edge_engine()
+        edge_engine = await get_edge_engine_cached()
         risk_multiplier = edge_engine.risk_multiplier()
         risk_amount = base_risk_amount * risk_multiplier
         logger.debug("[EdgeEngine] Position sizing: base=%.2f, multiplier=%.2f, final=%.2f", base_risk_amount, risk_multiplier, risk_amount)
@@ -3120,7 +3156,8 @@ async def check_btc_conditions(exchange) -> Dict:
         crash_threshold = CONFIG["BTC_CRASH_THRESHOLD"]
         if change_1h <= crash_threshold or change_4h <= crash_threshold * 1.5:
             state = "CRASH"
-        elif current_price > ema200_1h and ema200_slope_up and rsi_1h > 45:
+        elif current_price > ema200_1h and ema200_slope_up and rsi_1h > 45 and change_1h >= CONFIG["BTC_WARNING_THRESHOLD"]:
+            # في حالة التحذير، نصنفها WEAK إذا كانت فوق EMA200 والميل صاعد وRSI>45 والتغير ضمن الحدود
             state = "WEAK"
         else:
             state = "OK"
@@ -4038,6 +4075,7 @@ async def _monitor_active_trades_internal(exchange):
             if current_price >= tp2 and not tp2_hit:
                 await partial_exit(symbol, trade, current_price, "TP2", CONFIG["TP2_EXIT_PCT"])
 
+# ===================== دالة BE و Trail المُحسّنة (إزالة _version من التحديثات) =====================
 async def apply_be_and_trail(symbol, entry, current_price, r_multiple, quantum_score,
                              be_moved, trailing_active, atr, order_block_low, liquidity_grab_level, version):
     """دالة مشتركة لتطبيق وقف الخسارة المتحرك (Break-even و Trailing)"""
@@ -4055,8 +4093,7 @@ async def apply_be_and_trail(symbol, entry, current_price, r_multiple, quantum_s
             new_sl = entry + (0.001 * entry)
         updates = {
             'current_sl': new_sl,
-            'be_moved': True,
-            '_version': version + 1
+            'be_moved': True
         }
         if await db_update_trade_with_version_async(symbol, updates, version):
             try:
@@ -4084,8 +4121,7 @@ async def apply_be_and_trail(symbol, entry, current_price, r_multiple, quantum_s
             if new_sl > 0:
                 updates = {
                     'current_sl': new_sl,
-                    'trailing_active': True,
-                    '_version': version + 1
+                    'trailing_active': True
                 }
                 if await db_update_trade_with_version_async(symbol, updates, version):
                     try:
@@ -4108,7 +4144,7 @@ async def fetch_ticker_safe(exchange, symbol):
         logger.error(f"[Ticker Error] {symbol}: {e}")
         return None
 
-# ===================== ENHANCED PARTIAL EXIT =====================
+# ===================== ENHANCED PARTIAL EXIT (إصلاح is_exiting) =====================
 async def partial_exit(symbol: str, trade: TradeState, exit_price: float, tp_level: str, exit_pct: float, exchange=None):
     # نستخدم try/finally لضمان تحرير القفل
     lock_acquired = await bot.get_trade_lock(symbol)
@@ -4119,29 +4155,39 @@ async def partial_exit(symbol: str, trade: TradeState, exit_price: float, tp_lev
         if symbol not in ACTIVE_TRADES:
             return
         current_trade = ACTIVE_TRADES[symbol]
+
         if current_trade.is_exiting:
             logger.warning(f"[partial_exit] Exit already in progress for {symbol}, skipping")
             return
-        current_trade.is_exiting = True
+
+        # افحص hit قبل ما ترفع is_exiting
         if tp_level == "TP1" and current_trade.tp1_hit:
             return
-        elif tp_level == "TP2" and current_trade.tp2_hit:
+        if tp_level == "TP2" and current_trade.tp2_hit:
             return
+
+        current_trade.is_exiting = True
+
         if tp_level == "TP1":
             current_trade.tp1_order_done = True
         elif tp_level == "TP2":
             current_trade.tp2_order_done = True
+
         entry_fill_amount = current_trade.entry_fill_amount
         current_version = current_trade._version
         sl_order_id = current_trade.sl_order_id
         remaining_position_before = current_trade.remaining_position
+
         await asyncio.to_thread(db_manager.save_trade, current_trade)
+
         sell_amount_base = entry_fill_amount * exit_pct
         live_sell_ok = True
         fill_price = exit_price
+
         # نحرر القفل مؤقتًا للقيام بعمليات API
         bot.release_trade_lock(symbol)
         lock_acquired = False
+
         if is_live_trading_enabled() and exchange and sell_amount_base > 0:
             sell_order = await market_sell_safe(exchange, symbol, sell_amount_base, max_retries=2)
             live_sell_ok = bool(sell_order)
@@ -4149,30 +4195,39 @@ async def partial_exit(symbol: str, trade: TradeState, exit_price: float, tp_lev
                 fill_price = safe_float(sell_order.get('average')) or safe_float(sell_order.get('price')) or exit_price
                 if not validate_price(fill_price):
                     fill_price = exit_price
+
         # نعيد الحصول على القفل لتحديث الحالة
         lock_acquired = await bot.get_trade_lock(symbol)
         if not lock_acquired:
             logger.error(f"[partial_exit] Failed to reacquire lock for {symbol} after API")
             return
+
         if symbol not in ACTIVE_TRADES:
             return
+
         current_trade = ACTIVE_TRADES[symbol]
+
         if not live_sell_ok:
             if tp_level == "TP1":
                 current_trade.tp1_order_done = False
             elif tp_level == "TP2":
                 current_trade.tp2_order_done = False
+
             current_trade.is_exiting = False
             await asyncio.to_thread(db_manager.save_trade, current_trade)
             asyncio.create_task(mark_trade_emergency(symbol, f"partial_sell_failed({tp_level})"))
             return
+
         if current_trade._version != current_version:
             logger.warning(f"[partial_exit] Version mismatch for {symbol}. Expected {current_version}, got {current_trade._version}. Proceeding.")
+
         risk = current_trade.entry - current_trade.original_sl
         actual_r_multiple = (fill_price - current_trade.entry) / risk if risk > 0 else 0
         exit_r = actual_r_multiple * exit_pct
+
         current_trade.remaining_position -= exit_pct
         current_trade.total_realized_r += exit_r
+
         if tp_level == "TP1":
             current_trade.tp1_hit = True
             logger.info(f"[TP1] {symbol} hit at {fill_price}")
@@ -4181,8 +4236,10 @@ async def partial_exit(symbol: str, trade: TradeState, exit_price: float, tp_lev
             current_trade.tp2_hit = True
             logger.info(f"[TP2] {symbol} hit at {fill_price}")
             STATS["tp2_hits"] += 1
+
         current_trade._version += 1
         current_trade.is_exiting = False
+
         if sl_order_id and exchange:
             remaining_base = entry_fill_amount * current_trade.remaining_position
             if remaining_base > 0:
@@ -4190,10 +4247,13 @@ async def partial_exit(symbol: str, trade: TradeState, exit_price: float, tp_lev
                 new_sl_order = await place_stop_loss_order(exchange, symbol, current_trade.current_sl, remaining_base)
                 if new_sl_order:
                     current_trade.sl_order_id = str(new_sl_order.get("id"))
+
         await asyncio.to_thread(db_manager.save_trade, current_trade)
+
         STATS["trades_partial"] += 1
         STATS["total_r_multiple"] += exit_r
         record_daily_r(exit_r)
+
         profit_pct = ((fill_price - current_trade.entry) / current_trade.entry) * 100
         mode_badge = "✅ LIVE" if is_live_trading_enabled() else ("🟨 PAPER" if getattr(current_trade, "is_paper", False) else "🟦 SIGNAL")
         message = f"""
@@ -4209,6 +4269,7 @@ async def partial_exit(symbol: str, trade: TradeState, exit_price: float, tp_lev
 """
         await send_telegram(message)
         logger.info(f"[Partial Exit] {symbol} - {tp_level} - {profit_pct:+.2f}% - {exit_pct*100:.0f}%")
+
         if current_trade.remaining_position <= 0.01:
             await close_trade_full(symbol, fill_price, "ALL_TPS", exchange=exchange)
     except Exception as e:
@@ -4217,7 +4278,7 @@ async def partial_exit(symbol: str, trade: TradeState, exit_price: float, tp_lev
         if lock_acquired:
             bot.release_trade_lock(symbol)
 
-# ===================== INSTITUTIONAL CLOSE TRADE FULL =====================
+# ===================== INSTITUTIONAL CLOSE TRADE FULL (مع حساب r_multiple بعد السعر الفعلي وتسجيل الخسائر) =====================
 async def close_trade_full(symbol: str, exit_price: float, exit_type: str, exchange=None, sell_order_info: Optional[Dict] = None):
     # نحصل على نسخة من بيانات الصفقة داخل القفل ثم نحرره
     trade_snapshot = None
@@ -4268,6 +4329,7 @@ async def close_trade_full(symbol: str, exit_price: float, exit_type: str, excha
         return
 
     risk = entry - original_sl
+    # حساب r_multiple بناءً على السعر الفعلي للبيع
     r_multiple = (exit_price - entry) / risk if risk > 0 else 0
     live_sell_ok = True
     fill_price = exit_price
@@ -4278,6 +4340,8 @@ async def close_trade_full(symbol: str, exit_price: float, exit_type: str, excha
         live_sell_ok = bool(sell_order)
         if live_sell_ok and sell_order:
             fill_price = safe_float(sell_order.get('average')) or safe_float(sell_order.get('price')) or exit_price
+            # إعادة حساب r_multiple بناءً على السعر الفعلي
+            r_multiple = (fill_price - entry) / risk if risk > 0 else 0
         if sl_order_id and exchange and exit_type in ("SL", "ALL_TPS", "EMERGENCY_RECOVERY"):
             await cancel_stop_loss_order(exchange, symbol, sl_order_id)
 
@@ -4287,7 +4351,7 @@ async def close_trade_full(symbol: str, exit_price: float, exit_type: str, excha
     total_r = total_realized_r + final_exit_r
 
     try:
-        edge_engine = await get_edge_engine()
+        edge_engine = await get_edge_engine_cached()
         await edge_engine.record_trade(
             r_multiple=total_r,
             quantum_score=quantum_score,
@@ -4298,6 +4362,11 @@ async def close_trade_full(symbol: str, exit_price: float, exit_type: str, excha
         logger.error("[EdgeEngine] Failed to record trade: %s", str(e))
 
     profit_pct = ((fill_price - entry) / entry) * 100
+
+    # سجل Final Exit R (قد يكون سالب) لتفعيل Daily Circuit بشكل صحيح
+    STATS["total_r_multiple"] += final_exit_r
+    record_daily_r(final_exit_r)
+
     if r_multiple <= 0:
         STATS["global_consecutive_losses"] = STATS.get("global_consecutive_losses", 0) + 1
         STATS["trades_lost"] += 1
@@ -4305,8 +4374,6 @@ async def close_trade_full(symbol: str, exit_price: float, exit_type: str, excha
     else:
         STATS["global_consecutive_losses"] = 0
         STATS["trades_won"] += 1
-        STATS["total_r_multiple"] += final_exit_r
-        record_daily_r(final_exit_r)
 
     await asyncio.to_thread(db_manager.record_trade_history, symbol, trade_snapshot, fill_price, exit_type, total_r, execution_mode)
 
@@ -4345,7 +4412,7 @@ async def close_trade_full(symbol: str, exit_price: float, exit_type: str, excha
     await asyncio.to_thread(db_manager.remove_trade, symbol)
     logger.info(f"[SL] {symbol} closed - {exit_type} - {profit_pct:+.2f}% - {final_exit_r:.2f}R (total {total_r:.2f}R)")
 
-# ===================== PERFORMANCE REPORT =====================
+# ===================== PERFORMANCE REPORT (مع استخدام get_edge_engine_cached) =====================
 async def generate_performance_report() -> str:
     try:
         reset_daily_counters()
@@ -4460,7 +4527,7 @@ async def generate_performance_report() -> str:
         metrics_summary = metrics.get_summary()
 
         try:
-            edge_engine = await get_edge_engine()
+            edge_engine = await get_edge_engine_cached()
             score_r_corr = getattr(edge_engine, 'score_r_corr', 1.0)
             trades_list = getattr(edge_engine, 'trades', [])
         except Exception:
