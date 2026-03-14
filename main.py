@@ -12,6 +12,8 @@ QUANTUM FLOW TRADING BOT v1.8.9 - ULTIMATE INSTITUTIONAL EDITION WITH EDGE INTEL
 - فصل التحذيرات عن الأخطاء في validate_config
 - تعديل save_emergency_checkpoint لتكون غير متزامنة
 - إزالة حلقة إعادة التشغيل من main() والاعتماد على معالجة الأخطاء داخل async_main
+- تحسين فلتر BTC بنظام الحالات (CRASH, WEAK, OK) مع السماح فقط بإشارات A+ في حالة WEAK
+- إضافة تسجيل تفصيلي لأسباب رفض BTC وإحصائيات الرفض
 """
 
 import asyncio
@@ -357,6 +359,7 @@ class TradingBot:
             "loop_count": 0,
             "last_reset_date": None,
             "global_consecutive_losses": 0,
+            "btc_reject_reasons": {},  # إحصائيات رفض BTC
         }
         self.lock_manager = EnhancedLockManager()
         self.symbol_cooldown: Dict[str, float] = {}
@@ -3064,23 +3067,37 @@ async def calculate_position_size(entry: float, sl: float, account_size: Optiona
     position_pct = (position_value / account_size) * 100
     return position_value, position_pct
 
-# ===================== دالة موحدة لفحص BTC =====================
+# ===================== دالة موحدة لفحص BTC (مُحسَّنة بنظام الحالات) =====================
 async def check_btc_conditions(exchange) -> Dict:
+    """
+    تقوم بفحص حالة BTC وإرجاع:
+    - trend: التصنيف القديم (للتوافق)
+    - change_1h, change_4h
+    - rsi, ema50, ema200, price
+    - state: CRASH, WEAK, OK
+    - ema200_slope_up: منطقي (هل الميل موجب آخر 3 شمعات)
+    - spread_pct: الفرق بين EMA50 و EMA200 كنسبة مئوية
+    - safe_to_trade: للتشغيل القديم
+    """
     if not CONFIG["ENABLE_BTC_FILTER"]:
-        return {"trend": "NEUTRAL", "change_1h": 0, "safe_to_trade": True}
+        return {"trend": "NEUTRAL", "change_1h": 0, "safe_to_trade": True, "state": "OK"}
+
     async with bot.btc_trend_lock:
         if bot.btc_trend and (time.time() - bot.btc_last_check) < 300:
             return bot.btc_trend
+
     try:
         await rate_limiter.wait_if_needed(weight=2)
         data = await cache.get_ohlcv(exchange, "BTC/USDT", "1h", 100)
         rate_limiter.reset_errors()
         if not data or len(data) < 20:
-            return {"trend": "NEUTRAL", "change_1h": 0, "safe_to_trade": True}
+            return {"trend": "NEUTRAL", "change_1h": 0, "safe_to_trade": True, "state": "OK"}
+
         df = pd.DataFrame(data, columns=['t','open','high','low','close','volume'])
         df = calculate_indicators(df)
         if df is None:
-            return {"trend": "NEUTRAL", "change_1h": 0, "safe_to_trade": True}
+            return {"trend": "NEUTRAL", "change_1h": 0, "safe_to_trade": True, "state": "OK"}
+
         current_price = safe_float(df['close'].iloc[-1])
         price_1h_ago = safe_float(df['close'].iloc[-2]) if len(df) >= 2 else current_price
         price_4h_ago = safe_float(df['close'].iloc[-5]) if len(df) >= 5 else price_1h_ago
@@ -3090,29 +3107,38 @@ async def check_btc_conditions(exchange) -> Dict:
         ema50_1h = df['ema50'].iloc[-1] if 'ema50' in df.columns else current_price
         ema200_1h = df['ema200'].iloc[-1] if 'ema200' in df.columns else current_price
 
-        if change_1h <= CONFIG["BTC_CRASH_THRESHOLD"] or change_4h <= CONFIG["BTC_CRASH_THRESHOLD"] * 1.5:
+        # حساب ميل EMA200 (آخر 3 شمعات)
+        ema200_slope_up = False
+        if len(df) >= 3 and 'ema200' in df.columns:
+            ema200_vals = df['ema200'].iloc[-3:].values
+            ema200_slope_up = (ema200_vals[-1] > ema200_vals[-2] > ema200_vals[-3])
+
+        # حساب الفرق بين EMA50 و EMA200 كنسبة مئوية
+        spread_pct = ((ema50_1h - ema200_1h) / ema200_1h) * 100 if ema200_1h != 0 else 0
+
+        # تحديد الحالة
+        crash_threshold = CONFIG["BTC_CRASH_THRESHOLD"]
+        if change_1h <= crash_threshold or change_4h <= crash_threshold * 1.5:
+            state = "CRASH"
+        elif current_price > ema200_1h and ema200_slope_up and rsi_1h > 45:
+            state = "WEAK"
+        else:
+            state = "OK"
+
+        # التصنيف القديم للتوافق
+        if state == "CRASH":
             trend = "CRASH"
             safe_to_trade = False
-        elif change_1h <= CONFIG["BTC_WARNING_THRESHOLD"]:
+        elif state == "WEAK":
             trend = "WARNING"
             safe_to_trade = True
-        elif change_1h >= -CONFIG["BTC_WARNING_THRESHOLD"]:
-            trend = "BULLISH"
-            safe_to_trade = True
         else:
-            trend = "NEUTRAL"
+            trend = "BULLISH" if change_1h >= -CONFIG["BTC_WARNING_THRESHOLD"] else "NEUTRAL"
             safe_to_trade = True
-
-        btc_filter_ok = True
-        if rsi_1h < 40:
-            btc_filter_ok = False
-        if current_price < ema50_1h:
-            btc_filter_ok = False
-        if ema50_1h <= ema200_1h:
-            btc_filter_ok = False
 
         result = {
             "trend": trend,
+            "state": state,
             "change_1h": round(change_1h, 2),
             "change_4h": round(change_4h, 2),
             "safe_to_trade": safe_to_trade,
@@ -3120,13 +3146,15 @@ async def check_btc_conditions(exchange) -> Dict:
             "rsi": rsi_1h,
             "ema50": ema50_1h,
             "ema200": ema200_1h,
-            "btc_filter_ok": btc_filter_ok
+            "ema200_slope_up": ema200_slope_up,
+            "spread_pct": round(spread_pct, 2)
         }
         async with bot.btc_trend_lock:
             bot.btc_trend = result
             bot.btc_last_check = time.time()
-        if trend == "CRASH":
-            logger.warning(f"[BTC] 🚨 تحذير: انهيار! 1H: {change_1h:.2f}%, 4H: {change_4h:.2f}%")
+
+        if state == "CRASH":
+            logger.warning(f"[BTC] 🚨 انهيار! 1H: {change_1h:.2f}%, 4H: {change_4h:.2f}%")
             await send_telegram(
                 f"⚠️ تحذير انهيار BTC\n\n"
                 f"📉 التغير خلال ساعة: {change_1h:.2f}%\n"
@@ -3138,7 +3166,7 @@ async def check_btc_conditions(exchange) -> Dict:
     except Exception as e:
         rate_limiter.record_error()
         logger.error(f"[BTC Check Error] {str(e)[:100]}")
-        return {"trend": "NEUTRAL", "change_1h": 0, "safe_to_trade": True, "btc_filter_ok": True}
+        return {"trend": "NEUTRAL", "change_1h": 0, "safe_to_trade": True, "state": "OK"}
 
 # ===================== FIXED ORDER FLOW SAMPLING LOGIC =====================
 def should_run_order_flow(symbol: str, mtf_alignment: int, precheck_score: float, loop_count: int) -> bool:
@@ -3206,7 +3234,7 @@ async def get_btc_correlation(exchange, symbol: str) -> Optional[float]:
         logger.error(f"[BTC Correlation Error] {symbol}: {str(e)[:100]}")
         return None
 
-# ===================== INSTITUTIONAL SIGNAL GENERATOR =====================
+# ===================== INSTITUTIONAL SIGNAL GENERATOR (مع فلتر BTC المحسَّن) =====================
 @metrics.record_latency("signal_generation")
 async def generate_quantum_signal(exchange, symbol: str) -> Optional[QuantumSignal]:
     try:
@@ -3225,17 +3253,29 @@ async def generate_quantum_signal(exchange, symbol: str) -> Optional[QuantumSign
                             return None
             except Exception:
                 pass
+
         btc_info = await check_btc_conditions(exchange)
-        if not btc_info.get('btc_filter_ok', True):
-            logger.info(f"[BTC Filter] {symbol} rejected due to BTC conditions")
+        btc_state = btc_info.get("state", "OK")
+
+        # معالجة حالة CRASH (رفض فوري)
+        if btc_state == "CRASH":
+            logger.info(f"[BTC Filter] {symbol} rejected due to BTC crash: "
+                        f"1H={btc_info['change_1h']}%, 4H={btc_info['change_4h']}%, "
+                        f"rsi={btc_info['rsi']:.1f}, price={btc_info['price']:.2f}, "
+                        f"ema50={btc_info['ema50']:.2f}, ema200={btc_info['ema200']:.2f}, "
+                        f"spread={btc_info['spread_pct']}%, slope_up={btc_info['ema200_slope_up']}")
+            STATS.setdefault("btc_reject_reasons", {})["crash"] = STATS["btc_reject_reasons"].get("crash", 0) + 1
             return None
+
         corr = await get_btc_correlation(exchange, symbol)
         if corr is not None and corr < CONFIG.get("BTC_CORRELATION_THRESHOLD", 0.3):
             logger.info(f"[REJECT] {symbol} BTC correlation {corr:.2f} < {CONFIG.get('BTC_CORRELATION_THRESHOLD', 0.3)}")
             return None
+
         mtf = await analyze_multi_timeframe(exchange, symbol)
         if not mtf or mtf['signal'] != "ENTER":
             return None
+
         structure_1h = mtf['structure_1h']
         structure_15m = mtf['structure_15m']
         structure_5m = mtf['structure_5m']
@@ -3243,8 +3283,10 @@ async def generate_quantum_signal(exchange, symbol: str) -> Optional[QuantumSign
         df_1h = mtf['df_1h']
         df_15m = mtf['df_15m']
         df_5m = mtf['df_5m']
+
         if CONFIG["LONG_ONLY"] and structure_1h.structure != "BULLISH":
             return None
+
         if 'atr' in df_15m.columns and 'close' in df_15m.columns:
             atr_15m = df_15m['atr'].iloc[-1]
             price_15m = df_15m['close'].iloc[-1]
@@ -3253,8 +3295,10 @@ async def generate_quantum_signal(exchange, symbol: str) -> Optional[QuantumSign
                 if atr_pct_15m > CONFIG.get("MAX_ATR_PCT_15M", 8.0):
                     logger.info(f"[Volatility Filter] {symbol} 15m ATR% {atr_pct_15m:.2f}% > {CONFIG['MAX_ATR_PCT_15M']}% - skipping")
                     return None
+
         ob = structure_15m.order_block if (structure_15m and structure_15m.order_block) else None
         lg = liquidity_grab if (liquidity_grab and liquidity_grab.detected and liquidity_grab.grab_type == "BULLISH") else None
+
         if lg:
             last_close = df_5m['close'].iloc[-1]
             prev_high = df_5m['high'].iloc[-2]
@@ -3263,23 +3307,28 @@ async def generate_quantum_signal(exchange, symbol: str) -> Optional[QuantumSign
             if last_close < mid and df_5m['volume'].iloc[-1] <= df_5m['volume'].iloc[-2]:
                 logger.info(f"[REJECT] {symbol} Micro Structure: last close below midpoint and volume not increasing")
                 return None
+
         ok_accept, reason = price_acceptance_gate_5m(df_5m, ob, lg)
         if not ok_accept:
             if CONFIG.get("DEBUG_MODE"):
                 logger.info(f"[REJECT] {symbol} EntryGate: {reason}")
             return None
+
         if ob:
             entry = _ob_entry_price(ob)
         elif lg:
             entry = safe_float(lg.grab_level) * 1.0005
         else:
             return None
+
         if not validate_price(entry):
             return None
+
         atr = safe_float(df_15m['atr'].iloc[-1])
         sl, tp1, tp2 = compute_sl_and_tp_from_structure(entry, structure_15m, atr, liquidity_grab)
         if sl == 0:
             return None
+
         if 'rsi' in df_5m.columns:
             rsi_5m = df_5m['rsi'].iloc[-1]
             rsi_min = CONFIG.get("RSI_MIN", 30)
@@ -3287,14 +3336,27 @@ async def generate_quantum_signal(exchange, symbol: str) -> Optional[QuantumSign
             if rsi_5m < rsi_min or rsi_5m > rsi_max:
                 logger.info(f"[REJECT] {symbol} RSI 5m = {rsi_5m:.1f} outside {rsi_min}-{rsi_max}")
                 return None
+
         gates_ok, gates_list = evaluate_hard_gates(
             structure_15m, None, None, liquidity_grab, mtf['alignment'], df_15m
         )
         if CONFIG["ENABLE_HARD_GATES"] and not gates_ok:
             return None
+
         pre_qs, pre_conf, pre_class = calculate_quantum_score(
             structure_15m, None, None, liquidity_grab, mtf['alignment'], df_15m, gates_passed=gates_list
         )
+
+        # فلتر الحالة WEAK: نسمح فقط بإشارات A+
+        if btc_state == "WEAK" and pre_class != "QUANTUM_A+":
+            logger.info(f"[BTC Filter] {symbol} rejected: BTC state WEAK and signal not A+ (pre_class={pre_class}) - "
+                        f"Details: 1H={btc_info['change_1h']}%, 4H={btc_info['change_4h']}%, "
+                        f"rsi={btc_info['rsi']:.1f}, price={btc_info['price']:.2f}, "
+                        f"ema50={btc_info['ema50']:.2f}, ema200={btc_info['ema200']:.2f}, "
+                        f"spread={btc_info['spread_pct']}%, slope_up={btc_info['ema200_slope_up']}")
+            STATS.setdefault("btc_reject_reasons", {})["weak_not_a_plus"] = STATS["btc_reject_reasons"].get("weak_not_a_plus", 0) + 1
+            return None
+
         if pre_class == "QUANTUM_A+":
             reset_daily_counters()
             max_daily_a_plus = CONFIG.get("MAX_DAILY_A_PLUS", 7)
@@ -3346,6 +3408,7 @@ async def generate_quantum_signal(exchange, symbol: str) -> Optional[QuantumSign
         )
         if quantum_score < CONFIG["MIN_QUANTUM_SCORE"]:
             return None
+
         position_size_usdt, position_size_pct = await calculate_position_size(entry, sl, quantum_score=quantum_score)
         if position_size_usdt == 0:
             return None
@@ -4334,7 +4397,7 @@ async def generate_performance_report() -> str:
 • ✅ إصلاح منطق TALIB_FALLBACK
 • ✅ إزالة tp3 نهائياً من المنطق
 • ✅ إزالة المعامل غير المستخدم r_multiple من partial_exit
-• ✅ دمج وظائف BTC في دالة واحدة
+• ✅ دمج وظائف BTC في دالة واحدة (check_btc_conditions) مع نظام الحالات
 • ✅ إضافة قفل للمتغيرات العامة BTC_TREND
 • ✅ إزالة ازدواجية ديكورات القياس
 • ✅ تخزين edge_engine مرة واحدة
@@ -4463,6 +4526,7 @@ async def generate_performance_report() -> str:
 • Blacklisted Symbols (lock): {sum(1 for s in bot.lock_manager.failed_locks.keys() if bot.lock_manager.is_blacklisted(s))}
 • Consecutive Loss Blacklist: {len(bot.consecutive_loss_blacklist)}
 • Global Consecutive Losses: {STATS.get('global_consecutive_losses', 0)} / {CONFIG.get('MAX_CONSECUTIVE_LOSSES', 3)}
+• BTC Reject Reasons: {dict(STATS.get('btc_reject_reasons', {}))}
 """
         if metrics_summary:
             report += f"""
@@ -4489,7 +4553,6 @@ async def generate_performance_report() -> str:
 # ===================== COMPUTATIONAL OPTIMIZATION =====================
 async def toggle_computational_features():
     loop_count = STATS.get("loop_count", 0)
-    # ملاحظة: أزلنا CONFIG["_ORDER_FLOW_SAMPLING_OK"] لأنه غير مستخدم
     CONFIG["_VOLUME_PROFILE_SAMPLING_OK"] = (loop_count % 5 == 0)
     if loop_count % 7 == 0:
         await cache.smart_cache_cleanup()
@@ -4593,7 +4656,7 @@ async def main_loop(exchange):
         logger.info(f"الأطر الزمنية: {CONFIG['TF_TREND']}, {CONFIG['TF_STRUCTURE']}, {CONFIG['TF_ENTRY']}")
         logger.info(f"الحد الأدنى للنقاط: {CONFIG['MIN_QUANTUM_SCORE']}")
         logger.info(f"نظام البوابات الإجبارية: {'مفعل' if CONFIG['ENABLE_HARD_GATES'] else 'معطل'}")
-        logger.info(f"فلتر BTC: {'مفعل' if CONFIG['ENABLE_BTC_FILTER'] else 'معطل'}")
+        logger.info(f"فلتر BTC: {'مفعل' if CONFIG['ENABLE_BTC_FILTER'] else 'معطل'} (نظام الحالات: CRASH/WEAK/OK)")
         logger.info(f"LONG ONLY: {'✅' if CONFIG['LONG_ONLY'] else '❌'}")
         logger.info(f"LIVE TRADING: {'✅' if is_live_trading_enabled() else '❌'}")
         logger.info(f"PAPER TRADING: {'✅' if is_paper_trading_enabled() else '❌'}")
@@ -4640,7 +4703,7 @@ async def main_loop(exchange):
         logger.info("31. إصلاح منطق TALIB_FALLBACK")
         logger.info("32. إزالة tp3 نهائياً من المنطق")
         logger.info("33. إزالة المعامل غير المستخدم r_multiple من partial_exit")
-        logger.info("34. دمج وظائف BTC في دالة واحدة (check_btc_conditions)")
+        logger.info("34. دمج وظائف BTC في دالة واحدة (check_btc_conditions) مع نظام الحالات وإحصائيات الرفض")
         logger.info("35. إضافة قفل للمتغيرات العامة BTC_TREND")
         logger.info("36. إزالة ازدواجية ديكورات القياس")
         logger.info("37. تخزين edge_engine مرة واحدة")
@@ -4736,7 +4799,7 @@ async def main_loop(exchange):
 • ✅ إصلاح منطق TALIB_FALLBACK
 • ✅ إزالة tp3 نهائياً من المنطق
 • ✅ إزالة المعامل غير المستخدم r_multiple من partial_exit
-• ✅ دمج وظائف BTC في دالة واحدة
+• ✅ دمج وظائف BTC في دالة واحدة مع نظام الحالات (CRASH/WEAK/OK) وإحصائيات الرفض
 • ✅ إضافة قفل للمتغيرات العامة BTC_TREND
 • ✅ إزالة ازدواجية ديكورات القياس
 • ✅ تخزين edge_engine مرة واحدة
@@ -4784,7 +4847,7 @@ async def main_loop(exchange):
 
                 btc_status = await check_btc_conditions(exchange)
                 if not btc_status['safe_to_trade']:
-                    logger.warning(f"[Main] التداول متوقف مؤقتاً - BTC {btc_status['trend']}")
+                    logger.warning(f"[Main] التداول متوقف مؤقتاً - BTC {btc_status['trend']} (state: {btc_status.get('state')})")
                     await asyncio.sleep(60)
                     continue
 
@@ -4831,7 +4894,8 @@ async def main_loop(exchange):
                                 f"blacklisted={sum(1 for s in bot.lock_manager.failed_locks.keys() if bot.lock_manager.is_blacklisted(s))}, "
                                 f"loss_blacklist={len(bot.consecutive_loss_blacklist)}, "
                                 f"global_losses={STATS.get('global_consecutive_losses',0)}, "
-                                f"edge_state={bot.edge_engine.system_state}, edge_mult={bot.edge_engine.risk_multiplier():.2f}"
+                                f"edge_state={bot.edge_engine.system_state}, edge_mult={bot.edge_engine.risk_multiplier():.2f}, "
+                                f"btc_state={btc_status.get('state')}, btc_reject={STATS.get('btc_reject_reasons', {})}"
                     )
                 await asyncio.sleep(sleep_time)
             except KeyboardInterrupt:
